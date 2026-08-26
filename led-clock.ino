@@ -27,7 +27,7 @@
 #if defined(CONFIG_IDF_TARGET_ESP32C3)
 static const int PIN_SDA = 8;
 static const int PIN_SCL = 9;
-static const int PIN_IRQ = 7;
+static const int PIN_IRQ = 5;
 #elif defined(CONFIG_IDF_TARGET_ESP32S3)
 static const int PIN_SDA = 15; // 15;
 static const int PIN_SCL = 15; // 16;
@@ -551,7 +551,10 @@ void setup() {
   pinMode(PIN_IRQ, INPUT);
 
   Wire.begin(PIN_SDA, PIN_SCL);
-  Wire.setClock(100000);
+
+  // Lower the speed and set higher timeouts for SGP30 stability.
+  Wire.setClock(50000);
+  Wire.setTimeOut(25);
 
   delay(1000);
   log_printf("Starting\n");
@@ -586,9 +589,6 @@ void scan_i2c()
 }
 
 void loop() {
-  // scan_i2c(); // Temporary helper.
-
-  delay(10000);
   handleAs3935Irq();
 
   static uint32_t lastSensorPoll = 0;
@@ -598,11 +598,6 @@ void loop() {
     readDs3231();
     readAht20();
     readBmx280();
-  }
-
-  static uint32_t lastSgp30Poll = 0;
-  if (now - lastSgp30Poll >= SGP30_MEASURE_INTERVAL_MS) {
-    lastSgp30Poll = now;
     readSgp30();
   }
 }
