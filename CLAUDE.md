@@ -32,7 +32,8 @@ Everything lives in `led-clock.ino`. The chip target is selected at compile time
 
 ### Shared I2C bus
 
-All five sensors sit on one I2C bus (`Wire`, pins `PIN_SDA`/`PIN_SCL`, 100kHz). Generic helpers
+All five sensors sit on one I2C bus (`Wire`, pins `PIN_SDA`/`PIN_SCL`, 50kHz — lowered from the original 100kHz,
+with `Wire.setTimeOut(25)` also set, for SGP30 stability). Generic helpers
 (`i2cReadBytes`, `i2cReadRaw`, `i2cReadReg`, `i2cWriteReg`, `i2cProbe`, `i2cFindAddress`) wrap `Wire` calls and are
 used by all the per-device sections instead of each device rolling its own I2C code. `i2cReadRaw` exists specifically
 for devices like the AHT20 that return raw data streams rather than exposing addressable registers.
@@ -53,7 +54,9 @@ The file is organized into clearly delimited sections (see the `// ----` banners
   polled from `loop()` and decodes the interrupt source register (noise / disturber / lightning-with-distance-and-energy).
   Currently disabled — `initAs3935()` is commented out in `setup()`.
 - **DS3231 RTC** — `initDs3231()`/`readDs3231()`. Time registers are BCD-encoded (`bcdToDec`); assumes the RTC is
-  already configured for 24-hour mode.
+  already configured for 24-hour mode. `readDs3231()` also reads the chip's internal die temperature from registers
+  0x11/0x12 (signed integer °C in the MSB, plus 0.25°C steps from the top 2 bits of the LSB) and logs it alongside
+  the time.
 - **AHT20 temperature/humidity** — `initAht20()`/`readAht20()`. Uses raw command bytes (0xBE calibrate, 0xAC measure)
   rather than addressed registers; readings are 20-bit fixed-point values reconstructed from a 6-byte raw response.
 - **BMP280/BME280 pressure/temperature(/humidity)** — the most involved section. `initBmx280()` reads factory
@@ -70,9 +73,7 @@ The file is organized into clearly delimited sections (see the `// ----` banners
 
 ### Main loop
 
-`setup()` brings up `Wire`, runs a full `scan_i2c()` bus scan, then calls each `initX()`. `loop()` re-scans the I2C
-bus every iteration, services the AS3935 IRQ flag, and polls sensor readings on non-blocking `millis()`-based
-intervals — `SENSOR_POLL_INTERVAL_MS` (2000ms) for DS3231/AHT20/BMx280 and `SGP30_MEASURE_INTERVAL_MS` (1000ms) for
-SGP30 — rather than blocking `delay()` for the reads themselves. Note that `loop()` still does a blocking
-`delay(10000)` per iteration before any of these timers are checked, so in practice readings currently happen only
-once per ~10s loop iteration regardless of the configured interval constants.
+`setup()` brings up `Wire`, runs a full `scan_i2c()` bus scan once, then calls each `initX()`. `loop()` no longer
+re-scans the I2C bus or blocks on a `delay()` — it services the AS3935 IRQ flag every iteration and polls sensor
+readings on non-blocking `millis()`-based intervals: `SENSOR_POLL_INTERVAL_MS` (2000ms) for DS3231/AHT20/BMx280, and
+a separate `SGP30_MEASURE_INTERVAL_MS` (1000ms) timer for SGP30.

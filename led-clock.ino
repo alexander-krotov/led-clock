@@ -194,6 +194,7 @@ static void handleAs3935Irq() {
 static const uint8_t DS3231_ADDR = 0x68;
 static const uint8_t DS3231_REG_SECONDS = 0x00;
 static const uint8_t DS3231_REG_STATUS  = 0x0F;
+static const uint8_t DS3231_REG_TEMP_MSB = 0x11;
 
 static bool ds3231Present = false;
 
@@ -233,8 +234,17 @@ static void readDs3231() {
   uint8_t month   = bcdToDec(buf[5] & 0x1F);
   uint8_t year    = bcdToDec(buf[6]);
 
-  log_printf("DS3231 time: 20%02u-%02u-%02u %02u:%02u:%02u\n",
-             year, month, day, hours, minutes, seconds);
+  uint8_t tempBuf[2];
+  float temperatureC = NAN;
+  if (i2cReadBytes(DS3231_ADDR, DS3231_REG_TEMP_MSB, tempBuf, sizeof(tempBuf))) {
+    // MSB is a signed integer degrees-C; top 2 bits of LSB add 0.25C steps.
+    temperatureC = (int8_t)tempBuf[0] + ((tempBuf[1] >> 6) * 0.25f);
+  } else {
+    log_printf("DS3231 temperature read failed\n");
+  }
+
+  log_printf("DS3231 time: 20%02u-%02u-%02u %02u:%02u:%02u, temperature: %.2f C\n",
+             year, month, day, hours, minutes, seconds, temperatureC);
 }
 
 // ---------------------------------------------------------------------
@@ -598,6 +608,11 @@ void loop() {
     readDs3231();
     readAht20();
     readBmx280();
+  }
+
+  static uint32_t lastSgp30Poll = 0;
+  if (now - lastSgp30Poll >= SGP30_MEASURE_INTERVAL_MS) {
+    lastSgp30Poll = now;
     readSgp30();
   }
 }
