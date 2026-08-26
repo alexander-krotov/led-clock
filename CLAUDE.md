@@ -34,15 +34,43 @@ Everything lives in `led-clock.ino`. The chip target is selected at compile time
 
 All five sensors sit on one I2C bus (`Wire`, pins `PIN_SDA`/`PIN_SCL`, 50kHz — lowered from the original 100kHz,
 with `Wire.setTimeOut(25)` also set, for SGP30 stability). Generic helpers
-(`i2cReadBytes`, `i2cReadRaw`, `i2cReadReg`, `i2cWriteReg`, `i2cProbe`, `i2cFindAddress`) wrap `Wire` calls and are
-used by all the per-device sections instead of each device rolling its own I2C code. `i2cReadRaw` exists specifically
-for devices like the AHT20 that return raw data streams rather than exposing addressable registers.
+(`i2cReadBytes`, `i2cReadRaw`, `i2cReadReg`, `i2cWriteReg`, `i2cProbe`, `i2cFindAddress`) wrap `Wire` calls. The
+AS3935 section (the only sensor without a maintained Arduino library) talks to its registers directly through these
+helpers; the other four sensors are driven through per-device libraries (see Sensor libraries below), but still use
+`i2cProbe`/`i2cFindAddress` for presence/address detection before handing off to the library, since none of those
+libraries scan the bus or report "not found" on their own in a way this sketch relies on.
 
 Because the AS3935 and BMP280/BME280 boards can have their I2C address strapped differently depending on the board,
 `setup()` probes candidate addresses for those two (`i2cFindAddress`) rather than assuming a fixed address, and for
-the BMx280 additionally reads the chip ID register (0xD0) to distinguish a BMP280 (0x58, no humidity) from a BME280
-(0x60, has humidity) and picks the compensation/readout path accordingly. DS3231 and AHT20 use fixed addresses
-(0x68, 0x38).
+the BMx280 additionally reads back the chip ID (via `Adafruit_BME280::sensorID()`) to distinguish a BMP280 (0x58, no
+humidity) from a BME280 (0x60, has humidity) and picks the read path accordingly. DS3231 and AHT20 use fixed
+addresses (0x68, 0x38); the DS3231 library doesn't expose its address, so `DS3231_ADDR` is redeclared locally in the
+sketch just for the presence probe.
+
+### Sensor libraries
+
+Four of the five sensors are driven through third-party Arduino libraries rather than hand-rolled register access
+(install via Library Manager if missing):
+
+- **DS3231** (Eric Ayars' `DS3231` library, `DS3231.h`) — `DS3231 rtc;` with `rtc.getHour()/getMinute()/getSecond()/
+  getYear()/getMonth()/getDate()/getTemperature()`. It doesn't expose a `begin()` or the I2C address, so
+  presence is still established with a manual `i2cProbe(DS3231_ADDR)` before any `rtc.*` calls are trusted.
+- **Adafruit AHTX0** (`Adafruit_AHTX0.h`, depends on Adafruit Unified Sensor) — `Adafruit_AHTX0 aht;`,
+  `aht.begin()` then `aht.getEvent(&humidity, &temp)` filling `sensors_event_t` structs. Presence is
+  `i2cProbe(AHT20_ADDR) && aht.begin()` so a failed `begin()` (not just a failed bus probe) also clears the
+  present flag.
+- **Adafruit BME280 Library** (`Adafruit_BME280.h`, depends on Adafruit Unified Sensor) — `Adafruit_BME280 bme;`,
+  `bme.begin(addr)` against whichever of 0x76/0x77 `i2cFindAddress` found, then `bme.sensorID()` to tell a BMP280
+  apart from a BME280 (see above) and `bme.readTemperature()/readPressure()/readHumidity()` (humidity only called
+  when a BME280 was detected — a BMP280 has no humidity element and returns NaN for it).
+- **Adafruit SGP30** (`Adafruit_SGP30.h`, depends on Adafruit Unified Sensor) — `Adafruit_SGP30 sgp;`, `sgp.begin()`
+  then, once per second, `sgp.IAQmeasure()` (its bool return must be checked — a failed measurement leaves
+  `sgp.eCO2`/`sgp.TVOC` stale rather than updating them) followed by reading the `sgp.eCO2`/`sgp.TVOC` members.
+- **Adafruit Unified Sensor** (`Adafruit_Sensor.h`) — not a sensor driver itself, just the shared `sensors_event_t`/
+  `Adafruit_Sensor` base type that AHTX0 and BME280 build on.
+
+The AS3935 has no such library in use here, so it stays on the raw `i2cReadReg`/`i2cWriteReg` helpers described
+above.
 
 ### Per-sensor sections
 
@@ -53,23 +81,23 @@ The file is organized into clearly delimited sections (see the `// ----` banners
   a `RISING`-edge interrupt on `PIN_IRQ` (`onAs3935Irq`, sets the `volatile irqFired` flag). `handleAs3935Irq()` is
   polled from `loop()` and decodes the interrupt source register (noise / disturber / lightning-with-distance-and-energy).
   Currently disabled — `initAs3935()` is commented out in `setup()`.
-- **DS3231 RTC** — `initDs3231()`/`readDs3231()`. Time registers are BCD-encoded (`bcdToDec`); assumes the RTC is
-  already configured for 24-hour mode. `readDs3231()` also reads the chip's internal die temperature from registers
-  0x11/0x12 (signed integer °C in the MSB, plus 0.25°C steps from the top 2 bits of the LSB) and logs it alongside
-  the time.
-- **AHT20 temperature/humidity** — `initAht20()`/`readAht20()`. Uses raw command bytes (0xBE calibrate, 0xAC measure)
-  rather than addressed registers; readings are 20-bit fixed-point values reconstructed from a 6-byte raw response.
-- **BMP280/BME280 pressure/temperature(/humidity)** — the most involved section. `initBmx280()` reads factory
-  calibration constants into `Bmx280Calib`, and `bmx280CompensateTemperature/Pressure/Humidity()` implement the
-  integer compensation formulas straight from the Bosch datasheet (temperature must be compensated first since it
-  produces the shared `bmx280TFine` value used by the pressure/humidity formulas).
+- **DS3231 RTC** — `initDs3231()`/`readDs3231()`, using the `DS3231` library (see Sensor libraries above) rather than
+  reading BCD time registers directly. `readDs3231()` also reads the chip's internal die temperature via
+  `rtc.getTemperature()` and logs it alongside the time.
+- **AHT20 temperature/humidity** — `initAht20()`/`readAht20()`, using Adafruit AHTX0 (`aht.begin()`/`aht.getEvent()`)
+  rather than the raw command-byte sequence (0xBE calibrate, 0xAC measure) the sketch used before adopting the
+  library.
+- **BMP280/BME280 pressure/temperature(/humidity)** — `initBmx280()` probes 0x76/0x77 (`i2cFindAddress`), calls
+  `bme.begin(addr)` (Adafruit BME280 Library), and uses `bme.sensorID()` to tell a BMP280 (0x58, no humidity) from a
+  BME280 (0x60, has humidity) so `readBmx280()` knows whether to call `bme.readHumidity()`. The manual Bosch
+  compensation-formula implementation this sketch used before adopting the library has been replaced by the
+  library's own `readTemperature()/readPressure()/readHumidity()`.
 - **SGP30 eCO2/TVOC gas sensor** — fixed address 0x58 (unrelated to the BMP280 chip-id value of the same number).
-  `initSgp30()` sends the `init_air_quality` command; `readSgp30()` sends `measure_air_quality` and reads back two
-  CRC-8-checked 16-bit words (eCO2, TVOC) via `sgp30ReadWords`/`sgp30Crc8`. Unlike the other sensors it isn't
-  addressed-register based, so it talks to `Wire` directly (`sgp30SendCommand`) the same way AHT20 does. Polled on
-  its own `SGP30_MEASURE_INTERVAL_MS` (1000ms) timer, separate from `SENSOR_POLL_INTERVAL_MS`, because Sensirion's
-  datasheet requires calling `measure_air_quality` once per second for the sensor's dynamic baseline compensation to
-  stay accurate.
+  `initSgp30()` calls `sgp.begin()` (Adafruit SGP30 library); `readSgp30()` calls `sgp.IAQmeasure()` once per second
+  and, on success, reads back `sgp.eCO2`/`sgp.TVOC`. A failed `IAQmeasure()` is logged and skipped rather than
+  logging stale values. Polled on its own `SGP30_MEASURE_INTERVAL_MS` (1000ms) timer, separate from
+  `SENSOR_POLL_INTERVAL_MS`, because Sensirion's datasheet requires calling `measure_air_quality` once per second for
+  the sensor's dynamic baseline compensation to stay accurate.
 
 ### Main loop
 
