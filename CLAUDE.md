@@ -116,6 +116,20 @@ The file is organized into clearly delimited sections (see the `// ----` banners
   a real-time DS3231 and its own temperature sensors, and the button specifically because GPIO5 is `PIN_IRQ` on the
   ESP32-C3 variant and must stay reserved for the AS3935 interrupt.
 
+### Global sensor readings
+
+A single file-scope `SensorReadings sensors;` struct holds the latest values from every sensor. Each `readX()` (and
+`handleAs3935Irq()`) writes its freshly-read values into the matching `sensors.<group>` sub-struct right after
+logging them, so downstream consumers pull from this struct instead of calling the sensor libraries directly. Groups:
+`ds3231` (date/time + on-chip `dieTempC`), `aht20` (`tempC`/`humidityPct`), `bmx280` (`tempC`/`pressurePa`/
+`humidityPct`, plus a `hasHumidity` flag — `humidityPct` is `NAN` on a BMP280), `sgp30` (`eco2Ppm`/`tvocPpb`), and
+`as3935` (`lastIntSrc` and, for a lightning strike, `distanceKm`/`energy`). Every group carries a `valid` flag (false
+until the first good reading, then sticky) and an `updatedMs` millis() timestamp of its last update; static storage
+zero-initializes all of it. The one exception is `sgp30`: its readings are stored from the first measurement, but
+`sgp30.valid` stays false until `SGP30_WARMUP_MS` (4 hours) after power-on, because the sensor's dynamic baseline
+needs hours to settle before eCO2/TVOC mean anything. Nothing consumes the struct yet — it's the staging point for
+planned features.
+
 ### Main loop
 
 `setup()` brings up `Wire`, runs a full `scan_i2c()` bus scan once, then calls each `initX()` (including

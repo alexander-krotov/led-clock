@@ -128,6 +128,66 @@ static uint8_t i2cFindAddress(const uint8_t *candidates, size_t count) {
 }
 
 // ---------------------------------------------------------------------
+// Global sensor readings
+//
+// Every readX() / handleXIrq() writes its latest values into this single
+// struct as soon as it has them, so later consumers (e.g. the display)
+// can pull from here instead of talking to the sensors directly.
+//
+// Per group: `valid` becomes true after the first good reading and stays
+// true; `updatedMs` is the millis() timestamp of the most recent update.
+// Static storage zero-initializes everything, so all groups start
+// invalid with zeroed fields.
+// ---------------------------------------------------------------------
+
+struct SensorReadings {
+  struct {
+    bool valid;
+    uint32_t updatedMs;
+    uint16_t year;      // full 4-digit year
+    uint8_t month;
+    uint8_t day;
+    uint8_t hour;       // 24-hour
+    uint8_t minute;
+    uint8_t second;
+    float dieTempC;      // DS3231 on-chip temperature sensor
+  } ds3231;
+
+  struct {
+    bool valid;
+    uint32_t updatedMs;
+    float tempC;
+    float humidityPct;
+  } aht20;
+
+  struct {
+    bool valid;
+    uint32_t updatedMs;
+    bool hasHumidity;    // true = BME280, false = BMP280
+    float tempC;
+    float pressurePa;
+    float humidityPct;   // NAN when hasHumidity is false
+  } bmx280;
+
+  struct {
+    bool valid;
+    uint32_t updatedMs;
+    uint16_t eco2Ppm;
+    uint16_t tvocPpb;
+  } sgp30;
+
+  struct {
+    bool valid;
+    uint32_t updatedMs;  // timestamp of the most recent interrupt
+    uint8_t lastIntSrc;  // raw INT_SRC nibble: 0x01 noise, 0x04 disturber, 0x08 lightning
+    uint8_t distanceKm;  // meaningful only when lastIntSrc == 0x08
+    uint32_t energy;     // meaningful only when lastIntSrc == 0x08
+  } as3935;
+};
+
+static SensorReadings sensors;
+
+// ---------------------------------------------------------------------
 // AS3935 (WCMCU-3935 lightning sensor)
 // ---------------------------------------------------------------------
 
@@ -194,6 +254,13 @@ static void handleAs3935Irq() {
   delay(2); // datasheet: wait 2ms after IRQ before reading the interrupt source
 
   uint8_t intSrc = i2cReadReg(as3935Addr, REG_INT_SRC) & 0x0F;
+
+  sensors.as3935.valid      = true;
+  sensors.as3935.updatedMs  = millis();
+  sensors.as3935.lastIntSrc = intSrc;
+  sensors.as3935.distanceKm = 0;
+  sensors.as3935.energy     = 0;
+
   switch (intSrc) {
     case 0x01:
       log_printf("AS3935 IRQ: noise level too high\n");
@@ -206,6 +273,8 @@ static void handleAs3935Irq() {
       uint32_t energy = ((uint32_t)(i2cReadReg(as3935Addr, REG_ENERGY_MMSB) & 0x1F) << 16) |
                          ((uint32_t)i2cReadReg(as3935Addr, REG_ENERGY_MSB) << 8) |
                          i2cReadReg(as3935Addr, REG_ENERGY_LSB);
+      sensors.as3935.distanceKm = distance;
+      sensors.as3935.energy     = energy;
       log_printf("AS3935 IRQ: lightning detected, distance=%u km, energy=%u\n",
                  distance, energy);
       break;
@@ -250,6 +319,16 @@ static void readDs3231() {
   
   float temperatureC = rtc.getTemperature();
 
+  sensors.ds3231.valid     = true;
+  sensors.ds3231.updatedMs = millis();
+  sensors.ds3231.year      = 2000 + year;
+  sensors.ds3231.month     = month;
+  sensors.ds3231.day       = day;
+  sensors.ds3231.hour      = h;
+  sensors.ds3231.minute    = m;
+  sensors.ds3231.second    = s;
+  sensors.ds3231.dieTempC  = temperatureC;
+
   log_printf("DS3231 time: 20%02u-%02u-%02u %02u:%02u:%02u, temperature: %.2f C\n",
              year, month, day, h, m, s, temperatureC);
 }
@@ -277,6 +356,12 @@ static void readAht20() {
   }
   sensors_event_t humidity, temp;
   aht.getEvent(&humidity, &temp); // populate temp and humidity objects with fresh data
+
+  sensors.aht20.valid       = true;
+  sensors.aht20.updatedMs   = millis();
+  sensors.aht20.tempC       = temp.temperature;
+  sensors.aht20.humidityPct = humidity.relative_humidity;
+
   log_printf("AHT20: temperature=%.2f C, humidity=%.2f %%\n",
              temp.temperature, humidity.relative_humidity);
 }
@@ -315,9 +400,16 @@ static void readBmx280() {
   }
   float pressure = bme.readPressure();
   float temp = bme.readTemperature();
+  float humidity = bmx280HasHumidity ? bme.readHumidity() : NAN;
+
+  sensors.bmx280.valid       = true;
+  sensors.bmx280.updatedMs   = millis();
+  sensors.bmx280.hasHumidity = bmx280HasHumidity;
+  sensors.bmx280.tempC       = temp;
+  sensors.bmx280.pressurePa  = pressure;
+  sensors.bmx280.humidityPct = humidity;
 
   if (bmx280HasHumidity) {
-    float humidity = bme.readHumidity();
     log_printf("BME280: temperature=%.2f C, pressure=%.2f Pa, humidity=%.2f %%\n",
                temp, pressure, humidity);
   } else {
@@ -334,6 +426,12 @@ Adafruit_SGP30 sgp;
 // Sensirion recommends calling measure_air_quality exactly once per second
 // so the sensor's internal dynamic baseline compensation stays accurate.
 static const uint32_t SGP30_MEASURE_INTERVAL_MS = 1000;
+
+// The SGP30's dynamic baseline needs hours of continuous operation to
+// settle; until then eCO2/TVOC are effectively meaningless. We still keep
+// storing every reading, but don't mark sensors.sgp30 valid until this
+// long after power-on.
+static const uint32_t SGP30_WARMUP_MS = 4UL * 60 * 60 * 1000; // 4 hours
 
 static bool sgp30Present = false;
 
@@ -354,6 +452,13 @@ static void readSgp30() {
     return;
   }
 
+  sensors.sgp30.updatedMs = millis();
+  sensors.sgp30.eco2Ppm   = sgp.eCO2;
+  sensors.sgp30.tvocPpb   = sgp.TVOC;
+  if (millis() >= SGP30_WARMUP_MS) {
+    sensors.sgp30.valid = true;
+  }
+
   log_printf("SGP30: eCO2=%u ppm, TVOC=%u ppb\n", sgp.eCO2, sgp.TVOC);
 }
 
@@ -370,7 +475,7 @@ static void readSgp30() {
 #define MAX7219_MAX_DEVICES   4  // total 8x8 modules in the chain
 #define MAX7219_NUM_ZONES     4  // one virtual zone per time digit
 
-static const uint8_t MAX7219_BRIGHTNESS   = 7;   // MAX7219 range 0-15
+static uint8_t max7219Brightness = 4;            // MAX7219 range 0-15, runtime-adjustable
 static const uint32_t MAX7219_SCROLL_SPEED = 40; // ms per scroll frame
 
 MD_Parola maxDisplay(MAX7219_HARDWARE_TYPE, PIN_MAX7219_DATA, PIN_MAX7219_CLK,
@@ -407,7 +512,7 @@ static void initMax7219Zones() {
   for (uint8_t z = 0; z < MAX7219_NUM_ZONES; z++) {
     maxDisplay.setZone(z, z, z); // zone z = module z (1 module)
     maxDisplay.setSpeed(z, MAX7219_SCROLL_SPEED);
-    maxDisplay.setIntensity(z, MAX7219_BRIGHTNESS);
+    maxDisplay.setIntensity(z, max7219Brightness);
     maxDisplay.setPause(z, 0);
 
     max7219Zones[z].current    = '\0';
