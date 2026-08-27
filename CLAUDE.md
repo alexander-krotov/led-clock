@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-This is a single-sketch Arduino project (`led-clock.ino`) targeting an ESP32-based board (Ozobot RVDKit), despite the
-"led-clock" name it currently only implements I2C sensor discovery/polling — there is no LED or clock-display driving
-code yet, only an RTC (DS3231) being read for time.
+This is a single-sketch Arduino project (`led-clock.ino`) targeting an ESP32-based board (Ozobot RVDKit). It
+implements I2C sensor discovery/polling, an RTC (DS3231) being read for time, and now also drives a MAX7219 LED
+matrix display (via SPI, independent of the I2C sensor bus) that shows the current time as read from the DS3231.
 
 ## Build / upload
 
@@ -72,6 +72,11 @@ Four of the five sensors are driven through third-party Arduino libraries rather
 The AS3935 has no such library in use here, so it stays on the raw `i2cReadReg`/`i2cWriteReg` helpers described
 above.
 
+- **MD_Parola** / **MD_MAX72xx** (both by MajicDesigns, `MD_Parola.h`/`MD_MAX72xx.h`) — drive the MAX7219 LED matrix
+  display over bit-banged SPI (`PIN_MAX7219_DATA`/`PIN_MAX7219_CLK`/`PIN_MAX7219_CS`, fixed at GPIO7/6/10 regardless
+  of board target). Not gated behind a presence probe like the I2C sensors — it's on its own SPI-style bus, not the
+  shared `Wire` bus.
+
 ### Per-sensor sections
 
 The file is organized into clearly delimited sections (see the `// ----` banners), each following the same
@@ -98,10 +103,25 @@ The file is organized into clearly delimited sections (see the `// ----` banners
   logging stale values. Polled on its own `SGP30_MEASURE_INTERVAL_MS` (1000ms) timer, separate from
   `SENSOR_POLL_INTERVAL_MS`, because Sensirion's datasheet requires calling `measure_air_quality` once per second for
   the sensor's dynamic baseline compensation to stay accurate.
+- **MAX7219 LED matrix clock display** — `initMax7219()`/`pollMax7219()`, using MD_Parola/MD_MAX72xx (see Sensor
+  libraries above). Four 8x8 modules are addressed as one MD_Parola zone per HH:MM digit (`MAX7219_NUM_ZONES` = 4;
+  zone 3 = hours-tens down to zone 0 = minutes-units), each fed from the DS3231 RTC (`rtc.getHour()`/`getMinute()`)
+  once a second. A digit that changes scrolls down (`PA_SCROLL_DOWN`) while unchanged digits stay static; the colon
+  between hours and minutes has no Parola glyph, so it's drawn by poking two column bytes directly through
+  `MD_MAX72XX::setColumn()` (`drawMax7219Colon()`), redrawn every tick since Parola's own redraws can overwrite it.
+  Unlike the other sections there's no presence flag — the display isn't probed, and `pollMax7219()` only skips the
+  RTC read (not the animation tick, needed for smooth scrolling) when `ds3231Present` is false. This section was
+  adapted from a standalone example sketch that also had NTP time sync, temperature display, and a physical
+  brightness button on GPIO5; all three were dropped when merging — NTP/temperature because this project already has
+  a real-time DS3231 and its own temperature sensors, and the button specifically because GPIO5 is `PIN_IRQ` on the
+  ESP32-C3 variant and must stay reserved for the AS3935 interrupt.
 
 ### Main loop
 
-`setup()` brings up `Wire`, runs a full `scan_i2c()` bus scan once, then calls each `initX()`. `loop()` no longer
-re-scans the I2C bus or blocks on a `delay()` — it services the AS3935 IRQ flag every iteration and polls sensor
-readings on non-blocking `millis()`-based intervals: `SENSOR_POLL_INTERVAL_MS` (2000ms) for DS3231/AHT20/BMx280, and
-a separate `SGP30_MEASURE_INTERVAL_MS` (1000ms) timer for SGP30.
+`setup()` brings up `Wire`, runs a full `scan_i2c()` bus scan once, then calls each `initX()` (including
+`initMax7219()`). `loop()` no longer re-scans the I2C bus or blocks on a `delay()` — it services the AS3935 IRQ flag
+and ticks the MAX7219 display (`pollMax7219()`) every iteration, and polls sensor readings on non-blocking
+`millis()`-based intervals: `SENSOR_POLL_INTERVAL_MS` (2000ms) for DS3231/AHT20/BMx280, and a separate
+`SGP30_MEASURE_INTERVAL_MS` (1000ms) timer for SGP30. The MAX7219 display keeps its own internal 1000ms timer
+(inside `pollMax7219()`) for pushing a fresh HH:MM, decoupled from both of the above since it must also tick Parola's
+animation every loop iteration regardless of that timer.

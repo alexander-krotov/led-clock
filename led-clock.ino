@@ -1,16 +1,24 @@
 /*
- * ESP32 (Ozobot RVDKit) with sensors sharing one I2C bus:
+ * ESP32 (ESP32C3 Super Mini) with sensors sharing one I2C bus:
  *   - WCMCU-3935   (AS3935 lightning sensor)
  *   - DS3231       (RTC)
  *   - AHT20        (temperature/humidity)
  *   - BMP280/BME280 (pressure/temperature, BME280 also humidity)
  *   - SGP30        (eCO2/TVOC gas sensor)
  *
+ * ...plus a MAX7219 LED matrix display (4 x 8x8 modules, SPI bit-banged)
+ * driven by the DS3231 RTC, showing the current time HH:MM.
+ *
  * Wiring (shared bus):
- *   SCL -> IO18
- *   SDA -> IO17  (labeled MOSI on the WCMCU-3935 board, which doubles as
+ *   SCL -> IO9
+ *   SDA -> IO18 (labeled MOSI on the WCMCU-3935 board, which doubles as
  *                 I2C SDA in I2C mode)
- *   AS3935 IRQ -> IO4
+ *   AS3935 IRQ -> IO5
+ *
+ * Wiring (MAX7219 display, independent of the I2C bus above):
+ *   DIN     -> GPIO6
+ *   CLK     -> GPIO10
+ *   CS/LOAD -> GPIO7
  *
  * The AS3935 and BMx280 I2C addresses depend on how each board ties its
  * address pins, so setup() probes the common candidates for each and, for
@@ -22,12 +30,15 @@
  */
 
 #include <Wire.h>
+#include <SPI.h>
 
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <Adafruit_SGP30.h>
 #include <Adafruit_AHTX0.h>
 #include <DS3231.h>
+#include <MD_Parola.h>
+#include <MD_MAX72xx.h>
 
 #include "esp32-hal-log.h"
 
@@ -35,10 +46,21 @@
 static const int PIN_SDA = 8;
 static const int PIN_SCL = 9;
 static const int PIN_IRQ = 5;
+
+static const int PIN_MAX7219_CLK  = 10;
+static const int PIN_MAX7219_DATA = 6;
+static const int PIN_MAX7219_CS   = 7;
+
 #elif defined(CONFIG_IDF_TARGET_ESP32S3)
 static const int PIN_SDA = 15; // 15;
 static const int PIN_SCL = 15; // 16;
 static const int PIN_IRQ = 4;
+
+
+// MAX7219 display pins are fixed regardless of board target.
+static const int PIN_MAX7219_CLK  = 10;
+static const int PIN_MAX7219_DATA = 6;
+static const int PIN_MAX7219_CS   = 7;
 #else
 #error "Unknown target"
 #endif
@@ -336,6 +358,144 @@ static void readSgp30() {
 }
 
 // ---------------------------------------------------------------------
+// MAX7219 LED matrix clock display
+//
+// Four 8x8 modules, one MD_Parola zone per HH:MM digit (zone 3 = H-tens
+// down to zone 0 = M-units), driven by the DS3231 RTC. Digit changes
+// scroll down; the colon between hours and minutes is drawn directly via
+// the MD_MAX72XX layer since Parola has no built-in colon glyph.
+// ---------------------------------------------------------------------
+
+#define MAX7219_HARDWARE_TYPE MD_MAX72XX::FC16_HW
+#define MAX7219_MAX_DEVICES   4  // total 8x8 modules in the chain
+#define MAX7219_NUM_ZONES     4  // one virtual zone per time digit
+
+static const uint8_t MAX7219_BRIGHTNESS   = 7;   // MAX7219 range 0-15
+static const uint32_t MAX7219_SCROLL_SPEED = 40; // ms per scroll frame
+
+MD_Parola maxDisplay(MAX7219_HARDWARE_TYPE, PIN_MAX7219_DATA, PIN_MAX7219_CLK,
+                      PIN_MAX7219_CS, MAX7219_MAX_DEVICES);
+
+struct Max7219ZoneState {
+  char current;     // digit currently on screen
+  char next;        // digit being scrolled in
+  bool scrolling;    // true while animation is running
+  char buf[2];       // string buffer for the static/current digit
+  char bufNext[2];   // string buffer for the incoming digit
+};
+
+Max7219ZoneState max7219Zones[MAX7219_NUM_ZONES];
+
+// Colon dots sit at rows 2 and 5 (0-indexed from top); FC16 column byte
+// bit-order is bit7=row0. Adjust if your module variant differs.
+static const uint8_t MAX7219_COLON_BYTE = 0b00100100;
+
+static void drawMax7219Colon(bool visible) {
+  MD_MAX72XX *mx = maxDisplay.getGraphicObject();
+  uint8_t colByte = visible ? MAX7219_COLON_BYTE : 0x00;
+
+  // global_col = (MAX_DEVICES - 1 - module) * 8 + local_col, since the
+  // library reverses module order across the chain.
+  uint8_t colRight = (MAX7219_MAX_DEVICES - 1 - 2) * 8 + 7; // module 2 (H-units), local col 7
+  uint8_t colLeft  = (MAX7219_MAX_DEVICES - 1 - 1) * 8 + 0; // module 1 (M-tens), local col 0
+
+  mx->setColumn(colRight, colByte);
+  mx->setColumn(colLeft, colByte);
+}
+
+static void initMax7219Zones() {
+  for (uint8_t z = 0; z < MAX7219_NUM_ZONES; z++) {
+    maxDisplay.setZone(z, z, z); // zone z = module z (1 module)
+    maxDisplay.setSpeed(z, MAX7219_SCROLL_SPEED);
+    maxDisplay.setIntensity(z, MAX7219_BRIGHTNESS);
+    maxDisplay.setPause(z, 0);
+
+    max7219Zones[z].current    = '\0';
+    max7219Zones[z].next       = '\0';
+    max7219Zones[z].scrolling  = false;
+    max7219Zones[z].buf[0]     = ' ';
+    max7219Zones[z].buf[1]     = '\0';
+    max7219Zones[z].bufNext[0] = ' ';
+    max7219Zones[z].bufNext[1] = '\0';
+  }
+}
+
+static void triggerMax7219ScrollDown(uint8_t z, char newChar) {
+  max7219Zones[z].next       = newChar;
+  max7219Zones[z].bufNext[0] = newChar;
+  max7219Zones[z].bufNext[1] = '\0';
+  // PA_SCROLL_DOWN scrolls content downward (new digit enters from top).
+  maxDisplay.displayZoneText(z, max7219Zones[z].bufNext, PA_CENTER,
+                              MAX7219_SCROLL_SPEED, 0, PA_SCROLL_DOWN, PA_SCROLL_DOWN);
+  maxDisplay.displayReset(z);
+  max7219Zones[z].scrolling = true;
+}
+
+// Feed new HH MM digits to the four zones (zone 0=M-units .. zone 3=H-tens).
+static void updateMax7219Time(char hTens, char hUnits, char mTens, char mUnits) {
+  char digits[MAX7219_NUM_ZONES+1] = {mUnits, mTens, hUnits, hTens, 0};
+  log_printf("MAX7219 display=%s\n", digits);
+  for (uint8_t z = 0; z < MAX7219_NUM_ZONES; z++) {
+    if (max7219Zones[z].scrolling) {
+      continue; // wait for running scroll to finish
+    }
+    char d = digits[z];
+    if (d != max7219Zones[z].current) {
+      triggerMax7219ScrollDown(z, d);
+    }
+  }
+}
+
+static void initMax7219() {
+  maxDisplay.begin(MAX7219_NUM_ZONES);
+  initMax7219Zones();
+}
+
+// Ticks Parola's animation every call (needed for smooth scrolling) and
+// pushes a fresh HH:MM from the RTC once a second.
+static void pollMax7219() {
+  bool anyDone = maxDisplay.displayAnimate();
+  if (anyDone) {
+    for (uint8_t z = 0; z < MAX7219_NUM_ZONES; z++) {
+      if (!maxDisplay.getZoneStatus(z)) {
+        continue; // this zone is not done
+      }
+      if (max7219Zones[z].scrolling) {
+        // Scroll finished -- latch new digit and hold static.
+        max7219Zones[z].current   = max7219Zones[z].next;
+        max7219Zones[z].scrolling = false;
+        max7219Zones[z].buf[0]    = max7219Zones[z].current;
+        maxDisplay.displayZoneText(z, max7219Zones[z].buf, PA_CENTER,
+                                    MAX7219_SCROLL_SPEED, 0, PA_PRINT, PA_NO_EFFECT);
+        maxDisplay.displayReset(z);
+      }
+    }
+  }
+
+  // Redraw colon dots every tick; Parola redraws can overwrite them.
+  drawMax7219Colon(true);
+
+  if (!ds3231Present) {
+    log_printf("pollMax7219: no ds3231\n");
+    return;
+  }
+
+  static uint32_t lastMax7219SecMs = 0;
+  uint32_t now = millis();
+  if (now - lastMax7219SecMs > 1000UL) {
+    log_printf("time to update: now=%u\n", now);
+    lastMax7219SecMs = now;
+
+    bool h12Flag;
+    bool pmFlag;
+    unsigned int h = rtc.getHour(h12Flag, pmFlag);
+    unsigned int m = rtc.getMinute();
+
+    updateMax7219Time('0' + h / 10, '0' + h % 10, '0' + m / 10, '0' + m % 10);
+  }
+}
+
+// ---------------------------------------------------------------------
 
 void setup() {
   Serial.begin(115200);
@@ -357,6 +517,7 @@ void setup() {
   initAht20();
   initBmx280();
   initSgp30();
+  initMax7219();
 }
 
 void scan_i2c()
@@ -381,6 +542,7 @@ void scan_i2c()
 
 void loop() {
   handleAs3935Irq();
+  pollMax7219();
 
   static uint32_t lastSensorPoll = 0;
   uint32_t now = millis();
