@@ -29,6 +29,8 @@
  * same number.
  */
 
+#include <string.h>
+
 #include <Wire.h>
 #include <SPI.h>
 
@@ -329,8 +331,10 @@ static void readDs3231() {
   sensors.ds3231.second    = s;
   sensors.ds3231.dieTempC  = temperatureC;
 
+#if 0
   log_printf("DS3231 time: 20%02u-%02u-%02u %02u:%02u:%02u, temperature: %.2f C\n",
              year, month, day, h, m, s, temperatureC);
+#endif
 }
 
 // ---------------------------------------------------------------------
@@ -361,9 +365,10 @@ static void readAht20() {
   sensors.aht20.updatedMs   = millis();
   sensors.aht20.tempC       = temp.temperature;
   sensors.aht20.humidityPct = humidity.relative_humidity;
-
+#if 0
   log_printf("AHT20: temperature=%.2f C, humidity=%.2f %%\n",
              temp.temperature, humidity.relative_humidity);
+#endif
 }
 
 // ---------------------------------------------------------------------
@@ -409,12 +414,14 @@ static void readBmx280() {
   sensors.bmx280.pressurePa  = pressure;
   sensors.bmx280.humidityPct = humidity;
 
+#if 0
   if (bmx280HasHumidity) {
     log_printf("BME280: temperature=%.2f C, pressure=%.2f Pa, humidity=%.2f %%\n",
                temp, pressure, humidity);
   } else {
     log_printf("BMP280: temperature=%.2f C, pressure=%.2f Pa\n", temp, pressure);
   }
+#endif
 }
 
 // ---------------------------------------------------------------------
@@ -459,21 +466,29 @@ static void readSgp30() {
     sensors.sgp30.valid = true;
   }
 
+#if 0
   log_printf("SGP30: eCO2=%u ppm, TVOC=%u ppb\n", sgp.eCO2, sgp.TVOC);
+#endif
 }
 
 // ---------------------------------------------------------------------
 // MAX7219 LED matrix clock display
 //
-// Four 8x8 modules, one MD_Parola zone per HH:MM digit (zone 3 = H-tens
-// down to zone 0 = M-units), driven by the DS3231 RTC. Digit changes
-// scroll down; the colon between hours and minutes is drawn directly via
-// the MD_MAX72XX layer since Parola has no built-in colon glyph.
+// Four 8x8 modules split into two MD_Parola zones, both fed from the
+// DS3231 RTC once a second:
+//   - left zone  (modules 2-3): text "HH:", right-aligned
+//   - right zone (modules 0-1): text ":MM", left-aligned
+// The two colons meet in the middle of the chain and read as the HH:MM
+// separator. A zone whose text changes scrolls the new text down while
+// the other zone stays static.
 // ---------------------------------------------------------------------
 
 #define MAX7219_HARDWARE_TYPE MD_MAX72XX::FC16_HW
 #define MAX7219_MAX_DEVICES   4  // total 8x8 modules in the chain
-#define MAX7219_NUM_ZONES     4  // one virtual zone per time digit
+#define MAX7219_NUM_ZONES     2  // left = "HH:", right = ":MM"
+
+#define MAX7219_ZONE_RIGHT    0  // modules 0-1, ":MM", left-aligned
+#define MAX7219_ZONE_LEFT     1  // modules 2-3, "HH:", right-aligned
 
 static uint8_t max7219Brightness = 4;            // MAX7219 range 0-15, runtime-adjustable
 static const uint32_t MAX7219_SCROLL_SPEED = 40; // ms per scroll frame
@@ -482,71 +497,65 @@ MD_Parola maxDisplay(MAX7219_HARDWARE_TYPE, PIN_MAX7219_DATA, PIN_MAX7219_CLK,
                       PIN_MAX7219_CS, MAX7219_MAX_DEVICES);
 
 struct Max7219ZoneState {
-  char current;     // digit currently on screen
-  char next;        // digit being scrolled in
-  bool scrolling;    // true while animation is running
-  char buf[2];       // string buffer for the static/current digit
-  char bufNext[2];   // string buffer for the incoming digit
+  textPosition_t align;  // PA_LEFT / PA_RIGHT for this zone
+  char current[8];       // text currently on screen (Parola holds this pointer)
+  char next[8];          // text being scrolled in
+  bool scrolling;        // true while a scroll animation is running
 };
 
 Max7219ZoneState max7219Zones[MAX7219_NUM_ZONES];
 
-// Colon dots sit at rows 2 and 5 (0-indexed from top); FC16 column byte
-// bit-order is bit7=row0. Adjust if your module variant differs.
-static const uint8_t MAX7219_COLON_BYTE = 0b00100100;
-
-static void drawMax7219Colon(bool visible) {
-  MD_MAX72XX *mx = maxDisplay.getGraphicObject();
-  uint8_t colByte = visible ? MAX7219_COLON_BYTE : 0x00;
-
-  // global_col = (MAX_DEVICES - 1 - module) * 8 + local_col, since the
-  // library reverses module order across the chain.
-  uint8_t colRight = (MAX7219_MAX_DEVICES - 1 - 2) * 8 + 7; // module 2 (H-units), local col 7
-  uint8_t colLeft  = (MAX7219_MAX_DEVICES - 1 - 1) * 8 + 0; // module 1 (M-tens), local col 0
-
-  mx->setColumn(colRight, colByte);
-  mx->setColumn(colLeft, colByte);
-}
-
 static void initMax7219Zones() {
+  maxDisplay.setZone(MAX7219_ZONE_RIGHT, 0, 1);
+  maxDisplay.setZone(MAX7219_ZONE_LEFT, 2, 3);
+
+  max7219Zones[MAX7219_ZONE_RIGHT].align = PA_LEFT;
+  max7219Zones[MAX7219_ZONE_LEFT].align  = PA_RIGHT;
+
+  MD_MAX72XX::fontType_t *fontDef;
+
   for (uint8_t z = 0; z < MAX7219_NUM_ZONES; z++) {
-    maxDisplay.setZone(z, z, z); // zone z = module z (1 module)
     maxDisplay.setSpeed(z, MAX7219_SCROLL_SPEED);
     maxDisplay.setIntensity(z, max7219Brightness);
     maxDisplay.setPause(z, 0);
 
-    max7219Zones[z].current    = '\0';
-    max7219Zones[z].next       = '\0';
+    max7219Zones[z].current[0] = '\0';
+    max7219Zones[z].next[0]    = '\0';
     max7219Zones[z].scrolling  = false;
-    max7219Zones[z].buf[0]     = ' ';
-    max7219Zones[z].buf[1]     = '\0';
-    max7219Zones[z].bufNext[0] = ' ';
-    max7219Zones[z].bufNext[1] = '\0';
+
+    maxDisplay.displayZoneText(z, max7219Zones[z].current, max7219Zones[z].align,
+                                MAX7219_SCROLL_SPEED, 0, PA_PRINT, PA_NO_EFFECT);
   }
 }
 
-static void triggerMax7219ScrollDown(uint8_t z, char newChar) {
-  max7219Zones[z].next       = newChar;
-  max7219Zones[z].bufNext[0] = newChar;
-  max7219Zones[z].bufNext[1] = '\0';
-  // PA_SCROLL_DOWN scrolls content downward (new digit enters from top).
-  maxDisplay.displayZoneText(z, max7219Zones[z].bufNext, PA_CENTER,
+static void triggerMax7219ScrollDown(uint8_t z, const char *text) {
+  strncpy(max7219Zones[z].next, text, sizeof(max7219Zones[z].next) - 1);
+  max7219Zones[z].next[sizeof(max7219Zones[z].next) - 1] = '\0';
+  // PA_SCROLL_DOWN scrolls content downward (new text enters from the top).
+  maxDisplay.displayZoneText(z, max7219Zones[z].next, max7219Zones[z].align,
                               MAX7219_SCROLL_SPEED, 0, PA_SCROLL_DOWN, PA_SCROLL_DOWN);
   maxDisplay.displayReset(z);
   max7219Zones[z].scrolling = true;
 }
 
-// Feed new HH MM digits to the four zones (zone 0=M-units .. zone 3=H-tens).
+// Feed a fresh HH:MM to the two zones ("HH:" left, ":MM" right).
 static void updateMax7219Time(char hTens, char hUnits, char mTens, char mUnits) {
-  char digits[MAX7219_NUM_ZONES+1] = {mUnits, mTens, hUnits, hTens, 0};
-  log_printf("MAX7219 display=%s\n", digits);
+  char leftText[8]  = {hTens, hUnits,  '\0'};
+  char rightText[8] = {':', mTens, mUnits, '\0'};
+  const char *want[MAX7219_NUM_ZONES];
+  want[MAX7219_ZONE_LEFT]  = leftText;
+  want[MAX7219_ZONE_RIGHT] = rightText;
+
+#if 0
+  log_printf("MAX7219 display=%s%s\n", leftText, rightText);
+#endif
+
   for (uint8_t z = 0; z < MAX7219_NUM_ZONES; z++) {
     if (max7219Zones[z].scrolling) {
-      continue; // wait for running scroll to finish
+      continue; // wait for the running scroll to finish
     }
-    char d = digits[z];
-    if (d != max7219Zones[z].current) {
-      triggerMax7219ScrollDown(z, d);
+    if (strcmp(want[z], max7219Zones[z].current) != 0) {
+      triggerMax7219ScrollDown(z, want[z]);
     }
   }
 }
@@ -559,26 +568,19 @@ static void initMax7219() {
 // Ticks Parola's animation every call (needed for smooth scrolling) and
 // pushes a fresh HH:MM from the RTC once a second.
 static void pollMax7219() {
-  bool anyDone = maxDisplay.displayAnimate();
-  if (anyDone) {
+  if (maxDisplay.displayAnimate()) {
     for (uint8_t z = 0; z < MAX7219_NUM_ZONES; z++) {
-      if (!maxDisplay.getZoneStatus(z)) {
-        continue; // this zone is not done
+      if (!maxDisplay.getZoneStatus(z) || !max7219Zones[z].scrolling) {
+        continue;
       }
-      if (max7219Zones[z].scrolling) {
-        // Scroll finished -- latch new digit and hold static.
-        max7219Zones[z].current   = max7219Zones[z].next;
-        max7219Zones[z].scrolling = false;
-        max7219Zones[z].buf[0]    = max7219Zones[z].current;
-        maxDisplay.displayZoneText(z, max7219Zones[z].buf, PA_CENTER,
-                                    MAX7219_SCROLL_SPEED, 0, PA_PRINT, PA_NO_EFFECT);
-        maxDisplay.displayReset(z);
-      }
+      // Scroll finished -- latch the new text and hold it static.
+      strcpy(max7219Zones[z].current, max7219Zones[z].next);
+      max7219Zones[z].scrolling = false;
+      maxDisplay.displayZoneText(z, max7219Zones[z].current, max7219Zones[z].align,
+                                  MAX7219_SCROLL_SPEED, 0, PA_PRINT, PA_NO_EFFECT);
+      maxDisplay.displayReset(z);
     }
   }
-
-  // Redraw colon dots every tick; Parola redraws can overwrite them.
-  drawMax7219Colon(true);
 
   if (!ds3231Present) {
     log_printf("pollMax7219: no ds3231\n");
@@ -588,7 +590,6 @@ static void pollMax7219() {
   static uint32_t lastMax7219SecMs = 0;
   uint32_t now = millis();
   if (now - lastMax7219SecMs > 1000UL) {
-    log_printf("time to update: now=%u\n", now);
     lastMax7219SecMs = now;
 
     bool h12Flag;
