@@ -36,7 +36,9 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <WebServer.h>
 #include <EEPROM.h>
+#include <ArduinoJson.h>
 
 #define WM_MDNS  // let WiFiManager start an mDNS responder for its hostname
 #include <WiFiManager.h>
@@ -753,6 +755,11 @@ static const uint32_t NTP_UNIX_EPOCH_DIFF   = 2208988800UL;      // 1900 -> 1970
 
 static WiFiUDP ntpUdp;
 
+// loop() scheduling state for syncNtp(); file-scope so an MCP config change
+// can force an immediate re-sync by clearing ntpLastAttemptMs.
+static uint32_t ntpLastAttemptMs = 0;
+static bool     ntpLastOk        = false;
+
 // Returns UTC epoch seconds from the configured NTP server, or 0 on failure.
 static uint32_t fetchNtpEpoch() {
   IPAddress serverIp;
@@ -815,6 +822,292 @@ static bool syncNtp() {
 }
 
 // ---------------------------------------------------------------------
+// MCP server (Model Context Protocol over HTTP)
+//
+// Unauthenticated JSON-RPC 2.0 endpoint at
+//   POST http://led-clock.local:MCP_PORT/mcp
+// served by the ESP32 core's synchronous WebServer: mcpServer.handleClient()
+// is pumped from loop(), so the handlers run in the loop task and can touch
+// I2C / flash directly (no other loop() work overlaps a request). Responses
+// are plain application/json -- no SSE streaming.
+//
+// Tools:
+//   get_sensors      -- dump the whole `sensors` struct
+//   get_ds3231_time  -- read the DS3231 wall clock live
+//   set_ntp_config   -- change ntpServer / utcOffsetHours, persist, re-sync
+// ---------------------------------------------------------------------
+
+static const uint16_t MCP_PORT = 8080;
+static const char     MCP_PROTOCOL_VERSION[] = "2025-06-18";
+
+static WebServer mcpServer(MCP_PORT);
+
+static void mcpAddText(JsonObject result, const String &text) {
+  JsonArray content = result["content"].to<JsonArray>();
+  JsonObject item = content.add<JsonObject>();
+  item["type"] = "text";
+  item["text"] = text;
+}
+
+static void mcpFillSensors(JsonObject o) {
+  JsonObject ds = o["ds3231"].to<JsonObject>();
+  ds["valid"]     = sensors.ds3231.valid;
+  ds["updatedMs"] = sensors.ds3231.updatedMs;
+  ds["year"]      = sensors.ds3231.year;
+  ds["month"]     = sensors.ds3231.month;
+  ds["day"]       = sensors.ds3231.day;
+  ds["hour"]      = sensors.ds3231.hour;
+  ds["minute"]    = sensors.ds3231.minute;
+  ds["second"]    = sensors.ds3231.second;
+  ds["dieTempC"]  = sensors.ds3231.dieTempC;
+
+  JsonObject aht = o["aht20"].to<JsonObject>();
+  aht["valid"]       = sensors.aht20.valid;
+  aht["updatedMs"]   = sensors.aht20.updatedMs;
+  aht["tempC"]       = sensors.aht20.tempC;
+  aht["humidityPct"] = sensors.aht20.humidityPct;
+
+  JsonObject bmx = o["bmx280"].to<JsonObject>();
+  bmx["valid"]       = sensors.bmx280.valid;
+  bmx["updatedMs"]   = sensors.bmx280.updatedMs;
+  bmx["hasHumidity"] = sensors.bmx280.hasHumidity;
+  bmx["tempC"]       = sensors.bmx280.tempC;
+  bmx["pressurePa"]  = sensors.bmx280.pressurePa;
+  bmx["humidityPct"] = sensors.bmx280.humidityPct;  // NaN on a BMP280 -> null
+
+  JsonObject sgp = o["sgp30"].to<JsonObject>();
+  sgp["valid"]     = sensors.sgp30.valid;
+  sgp["updatedMs"] = sensors.sgp30.updatedMs;
+  sgp["eco2Ppm"]   = sensors.sgp30.eco2Ppm;
+  sgp["tvocPpb"]   = sensors.sgp30.tvocPpb;
+
+  JsonObject as = o["as3935"].to<JsonObject>();
+  as["valid"]      = sensors.as3935.valid;
+  as["updatedMs"]  = sensors.as3935.updatedMs;
+  as["lastIntSrc"] = sensors.as3935.lastIntSrc;
+  as["distanceKm"] = sensors.as3935.distanceKm;
+  as["energy"]     = sensors.as3935.energy;
+}
+
+static void mcpToolGetSensors(JsonObject result) {
+  JsonObject sc = result["structuredContent"].to<JsonObject>();
+  mcpFillSensors(sc);
+  String text;
+  serializeJson(sc, text);
+  mcpAddText(result, text);
+}
+
+static void mcpToolGetDs3231Time(JsonObject result, bool &isError) {
+  if (!ds3231Present) {
+    mcpAddText(result, "DS3231 not present");
+    isError = true;
+    return;
+  }
+
+  bool h12Flag, pmFlag, century;
+  unsigned year   = 2000 + rtc.getYear();
+  unsigned month  = rtc.getMonth(century);
+  unsigned day    = rtc.getDate();
+  unsigned hour   = rtc.getHour(h12Flag, pmFlag);
+  unsigned minute = rtc.getMinute();
+  unsigned second = rtc.getSecond();
+  float dieTempC  = rtc.getTemperature();
+
+  char formatted[24];
+  snprintf(formatted, sizeof(formatted), "%04u-%02u-%02u %02u:%02u:%02u",
+           year, month, day, hour, minute, second);
+
+  JsonObject sc = result["structuredContent"].to<JsonObject>();
+  sc["localTime"]      = String(formatted);
+  sc["year"]           = year;
+  sc["month"]          = month;
+  sc["day"]            = day;
+  sc["hour"]           = hour;
+  sc["minute"]         = minute;
+  sc["second"]         = second;
+  sc["dieTempC"]       = dieTempC;
+  sc["utcOffsetHours"] = utcOffsetHours;
+
+  String text;
+  serializeJson(sc, text);
+  mcpAddText(result, text);
+}
+
+static void mcpToolSetNtpConfig(JsonObjectConst args, JsonObject result, bool &isError) {
+  bool changed = false;
+
+  if (!args["ntp_server"].isNull()) {
+    const char *s = args["ntp_server"].as<const char *>();
+    if (s == nullptr || s[0] == '\0' || strlen(s) >= NTP_SERVER_MAXLEN) {
+      mcpAddText(result, "ntp_server must be 1.." + String(NTP_SERVER_MAXLEN - 1) + " characters");
+      isError = true;
+      return;
+    }
+    strncpy(ntpServer, s, NTP_SERVER_MAXLEN - 1);
+    ntpServer[NTP_SERVER_MAXLEN - 1] = '\0';
+    changed = true;
+  }
+
+  if (!args["utc_offset_hours"].isNull()) {
+    if (!args["utc_offset_hours"].is<int>()) {
+      mcpAddText(result, "utc_offset_hours must be an integer");
+      isError = true;
+      return;
+    }
+    int offset = args["utc_offset_hours"].as<int>();
+    if (offset < -14 || offset > 14) {
+      mcpAddText(result, "utc_offset_hours must be between -14 and 14");
+      isError = true;
+      return;
+    }
+    utcOffsetHours = (int8_t)offset;
+    changed = true;
+  }
+
+  if (!changed) {
+    mcpAddText(result, "provide ntp_server and/or utc_offset_hours");
+    isError = true;
+    return;
+  }
+
+  saveConfig();
+  ntpLastAttemptMs = 0;  // force a fresh NTP sync with the new settings
+
+  JsonObject sc = result["structuredContent"].to<JsonObject>();
+  sc["ntp_server"]       = String(ntpServer);
+  sc["utc_offset_hours"] = utcOffsetHours;
+  String text;
+  serializeJson(sc, text);
+  mcpAddText(result, text);
+}
+
+static void mcpFillToolsList(JsonObject result) {
+  JsonArray tools = result["tools"].to<JsonArray>();
+
+  {
+    JsonObject t = tools.add<JsonObject>();
+    t["name"] = "get_sensors";
+    t["description"] = "Read every sensor group from the clock's SensorReadings struct "
+                       "(ds3231, aht20, bmx280, sgp30, as3935), each with its valid flag "
+                       "and updatedMs timestamp.";
+    JsonObject schema = t["inputSchema"].to<JsonObject>();
+    schema["type"] = "object";
+    schema["properties"].to<JsonObject>();
+  }
+  {
+    JsonObject t = tools.add<JsonObject>();
+    t["name"] = "get_ds3231_time";
+    t["description"] = "Read the current wall-clock time live from the DS3231 RTC "
+                       "(local time, i.e. UTC plus the configured offset).";
+    JsonObject schema = t["inputSchema"].to<JsonObject>();
+    schema["type"] = "object";
+    schema["properties"].to<JsonObject>();
+  }
+  {
+    JsonObject t = tools.add<JsonObject>();
+    t["name"] = "set_ntp_config";
+    t["description"] = "Update the NTP server hostname and/or the UTC offset (hours). "
+                       "Changes are persisted to EEPROM and trigger an immediate re-sync.";
+    JsonObject schema = t["inputSchema"].to<JsonObject>();
+    schema["type"] = "object";
+    JsonObject props = schema["properties"].to<JsonObject>();
+    JsonObject p1 = props["ntp_server"].to<JsonObject>();
+    p1["type"] = "string";
+    p1["description"] = "NTP server hostname, e.g. fi.pool.ntp.org";
+    JsonObject p2 = props["utc_offset_hours"].to<JsonObject>();
+    p2["type"] = "integer";
+    p2["minimum"] = -14;
+    p2["maximum"] = 14;
+    p2["description"] = "Hours to add to UTC before writing the RTC";
+  }
+}
+
+static void mcpSendJson(JsonDocument &doc, int code = 200) {
+  String out;
+  serializeJson(doc, out);
+  mcpServer.send(code, "application/json", out);
+}
+
+static void handleMcpPost() {
+  const String &body = mcpServer.arg("plain");
+
+  JsonDocument req;
+  if (deserializeJson(req, body) != DeserializationError::Ok || !req.is<JsonObject>()) {
+    JsonDocument resp;
+    resp["jsonrpc"] = "2.0";
+    resp["id"] = nullptr;
+    JsonObject e = resp["error"].to<JsonObject>();
+    e["code"] = -32700;
+    e["message"] = "Parse error";
+    mcpSendJson(resp);
+    return;
+  }
+
+  const char *method = req["method"].as<const char *>();
+  if (method == nullptr) method = "";
+
+  // A JSON-RPC notification has no id -- acknowledge without a body.
+  if (req["id"].isNull()) {
+    mcpServer.send(202, "text/plain", "");
+    return;
+  }
+
+  JsonDocument resp;
+  resp["jsonrpc"] = "2.0";
+  resp["id"] = req["id"];
+
+  if (strcmp(method, "initialize") == 0) {
+    JsonObject result = resp["result"].to<JsonObject>();
+    result["protocolVersion"] = MCP_PROTOCOL_VERSION;
+    result["capabilities"].to<JsonObject>()["tools"].to<JsonObject>();
+    JsonObject info = result["serverInfo"].to<JsonObject>();
+    info["name"] = "led-clock";
+    info["version"] = "1.0.0";
+  } else if (strcmp(method, "ping") == 0) {
+    resp["result"].to<JsonObject>();
+  } else if (strcmp(method, "tools/list") == 0) {
+    mcpFillToolsList(resp["result"].to<JsonObject>());
+  } else if (strcmp(method, "tools/call") == 0) {
+    JsonObjectConst params = req["params"].as<JsonObjectConst>();
+    const char *name = params["name"].as<const char *>();
+    if (name == nullptr) name = "";
+    JsonObjectConst args = params["arguments"].as<JsonObjectConst>();
+
+    JsonObject result = resp["result"].to<JsonObject>();
+    bool isError = false;
+    if (strcmp(name, "get_sensors") == 0) {
+      mcpToolGetSensors(result);
+    } else if (strcmp(name, "get_ds3231_time") == 0) {
+      mcpToolGetDs3231Time(result, isError);
+    } else if (strcmp(name, "set_ntp_config") == 0) {
+      mcpToolSetNtpConfig(args, result, isError);
+    } else {
+      mcpAddText(result, String("unknown tool: ") + name);
+      isError = true;
+    }
+    if (isError) result["isError"] = true;
+  } else {
+    JsonObject e = resp["error"].to<JsonObject>();
+    e["code"] = -32601;
+    e["message"] = "Method not found";
+  }
+
+  mcpSendJson(resp);
+}
+
+static void initMcp() {
+  mcpServer.on("/mcp", HTTP_POST, handleMcpPost);
+  mcpServer.on("/mcp", HTTP_GET, []() {
+    mcpServer.send(405, "text/plain", "MCP endpoint accepts POST only");
+  });
+  mcpServer.onNotFound([]() {
+    mcpServer.send(404, "application/json", "{\"error\":\"not found\"}");
+  });
+  mcpServer.begin();
+  log_printf("MCP server on http://%s.local:%u/mcp\n", WIFI_DEVICE_NAME, MCP_PORT);
+}
+
+// ---------------------------------------------------------------------
 
 void setup() {
   Serial.begin(115200);
@@ -844,6 +1137,7 @@ void setup() {
 
   if (wifiConnected) {
     showIpOnMax7219();
+    initMcp();
   }
 }
 
@@ -886,11 +1180,13 @@ void loop() {
     readSgp30();
   }
 
-  static uint32_t lastNtpAttempt = 0;
-  static bool lastNtpOk = false;
-  uint32_t ntpInterval = lastNtpOk ? NTP_SYNC_INTERVAL_MS : NTP_RETRY_INTERVAL_MS;
-  if (wifiConnected && (lastNtpAttempt == 0 || now - lastNtpAttempt >= ntpInterval)) {
-    lastNtpAttempt = now;
-    lastNtpOk = syncNtp();
+  if (wifiConnected) {
+    mcpServer.handleClient();
+  }
+
+  uint32_t ntpInterval = ntpLastOk ? NTP_SYNC_INTERVAL_MS : NTP_RETRY_INTERVAL_MS;
+  if (wifiConnected && (ntpLastAttemptMs == 0 || now - ntpLastAttemptMs >= ntpInterval)) {
+    ntpLastAttemptMs = now;
+    ntpLastOk = syncNtp();
   }
 }

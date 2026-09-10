@@ -7,8 +7,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This is a single-sketch Arduino project (`led-clock.ino`) targeting an ESP32-based board (Ozobot RVDKit). It
 implements I2C sensor discovery/polling, an RTC (DS3231) used as the time source, drives a MAX7219 LED matrix
 display (via SPI, independent of the I2C sensor bus) that shows the current time as read from the DS3231, connects to
-WiFi at boot via WiFiManager (captive-portal provisioning, credentials stored in NVS), and keeps the DS3231
-disciplined to an NTP server (name + UTC offset configurable in the portal, persisted in EEPROM).
+WiFi at boot via WiFiManager (captive-portal provisioning, credentials stored in NVS), keeps the DS3231 disciplined
+to an NTP server (name + UTC offset configurable in the portal, persisted in EEPROM), and exposes an unauthenticated
+MCP (Model Context Protocol) HTTP endpoint for reading the sensors / RTC and changing the NTP config.
 
 ## Build / upload
 
@@ -23,7 +24,12 @@ arduino-cli upload -p <PORT> --fqbn esp32:esp32:esp32c3 .
 ```
 
 There are no automated tests — this is embedded firmware, verified by flashing to hardware and reading serial output
-at 115200 baud.
+at 115200 baud. The one exception is `test/mcp-test.sh`, a curl-based smoke test for the MCP server
+(see MCP below) that runs from any Linux/WSL shell against a running device:
+`MCP_HOST=<ip>:8080 bash test/mcp-test.sh` (`jq` optional).
+
+The full sketch is close to the 1.3 MB app limit of the default partition scheme (~94%); flash with a
+larger-app partition scheme (e.g. "Huge APP") if it stops fitting.
 
 ## Architecture
 
@@ -93,6 +99,11 @@ All five sensors are driven through third-party Arduino libraries rather than ha
   sketch's own EEPROM config.
 - **`EEPROM.h`** / **`WiFiUdp.h`** (ESP32 core) — `EEPROM` backs the persistent NTP config (see the EEPROM section
   below); `WiFiUDP` carries the SNTP request in the NTP section.
+- **`WebServer.h`** (ESP32 core) + **ArduinoJson** v7 — serve the MCP endpoint (see the MCP section). The core's
+  *synchronous* `WebServer` is used (not ESPAsyncWebServer — the installed `ESPAsyncWebServer 3.1.0` / `AsyncTCP 1.1.4`
+  don't compile against ESP32 core 3.x: their `WebRequestMethod` enum clashes with the core's `http_parser.h`).
+  `mcpServer.handleClient()` is pumped from `loop()`, so handlers run in the loop task. ArduinoJson v7's elastic
+  `JsonDocument` is used for both request parsing and response building.
 
 ### Per-sensor sections
 
@@ -166,6 +177,16 @@ The file is organized into clearly delimited sections (see the `// ----` banners
   drift. `loop()` calls `syncNtp()` on its first pass, then every `NTP_SYNC_INTERVAL_MS` (1h) once a sync has
   succeeded, or every `NTP_RETRY_INTERVAL_MS` (5min) while it is failing; the blocking UDP exchange stalls `loop()`
   (and the display animation) for up to ~1.5s each time.
+- **MCP server** — `initMcp()` (called from `setup()` only when WiFi connected) starts the synchronous `WebServer`
+  `mcpServer` on `MCP_PORT` (8080) serving JSON-RPC 2.0 at `POST /mcp` — an unauthenticated MCP endpoint,
+  `http://led-clock.local:8080/mcp`. `loop()` pumps `mcpServer.handleClient()`, so `handleMcpPost()` and the tool
+  handlers run in the loop task and may touch I2C / flash directly (nothing else in `loop()` overlaps a request).
+  `initialize` / `ping` / `tools/list` / `tools/call` are dispatched in `handleMcpPost` (`notifications/*` get a bare
+  `202`); responses are always `application/json`, never SSE; the request body comes from `mcpServer.arg("plain")`.
+  Three tools: `get_sensors` (dumps the `sensors` struct via `mcpFillSensors`), `get_ds3231_time` (reads the RTC
+  live), and `set_ntp_config` (`ntp_server` / `utc_offset_hours` args — validated, applied, `saveConfig()`'d, then
+  `ntpLastAttemptMs` is cleared to force an immediate NTP re-sync). Every tool result carries both a `content` text
+  block and a `structuredContent` object.
 
 ### Global sensor readings
 
@@ -178,18 +199,18 @@ logging them, so downstream consumers pull from this struct instead of calling t
 until the first good reading, then sticky) and an `updatedMs` millis() timestamp of its last update; static storage
 zero-initializes all of it. The one exception is `sgp30`: its readings are stored from the first measurement, but
 `sgp30.valid` stays false until `SGP30_WARMUP_MS` (4 hours) after power-on, because the sensor's dynamic baseline
-needs hours to settle before eCO2/TVOC mean anything. Nothing consumes the struct yet — it's the staging point for
-planned features.
+needs hours to settle before eCO2/TVOC mean anything. The MCP `get_sensors` tool serializes this struct;
+nothing else consumes it yet.
 
 ### Main loop
 
 `setup()` runs `EEPROM.begin()` + `loadConfig()`, brings up `Wire`, runs a full `scan_i2c()` bus scan once, then
 calls each `initX()` (including `initMax7219()` and, last, `initWifi()` — which can block on the WiFiManager config
-portal, see WiFi above — followed by `showIpOnMax7219()` when WiFi connected, which blocks while the IP address
-scrolls across the display once). `loop()` no longer re-scans the I2C bus or blocks on a `delay()` — it services the
-AS3935 IRQ flag and ticks the MAX7219 display (`pollMax7219()`) every iteration, and polls on non-blocking
-`millis()`-based intervals: `SENSOR_POLL_INTERVAL_MS` (2000ms) for DS3231/AHT20/BMx280, a separate
-`SGP30_MEASURE_INTERVAL_MS` (1000ms) timer for SGP30, and `NTP_SYNC_INTERVAL_MS` / `NTP_RETRY_INTERVAL_MS` for
-`syncNtp()` (see NTP above). The MAX7219 display keeps its own internal 1000ms timer (inside `pollMax7219()`) for
+portal, see WiFi above — followed, when WiFi connected, by `showIpOnMax7219()` (blocks while the IP scrolls once)
+and `initMcp()`). `loop()` no longer re-scans the I2C bus or blocks on a `delay()` — it services the AS3935 IRQ flag
+and ticks the MAX7219 display (`pollMax7219()`) every iteration, pumps `mcpServer.handleClient()` when WiFi is up,
+and polls on non-blocking `millis()`-based intervals: `SENSOR_POLL_INTERVAL_MS` (2000ms) for DS3231/AHT20/BMx280, a
+separate `SGP30_MEASURE_INTERVAL_MS` (1000ms) timer for SGP30, and `NTP_SYNC_INTERVAL_MS` / `NTP_RETRY_INTERVAL_MS`
+for `syncNtp()` (see NTP above). The MAX7219 display keeps its own internal 1000ms timer (inside `pollMax7219()`) for
 pushing a fresh HH:MM, decoupled from all of the above since it must also tick Parola's animation every loop
 iteration regardless of that timer.
