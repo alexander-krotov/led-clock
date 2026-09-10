@@ -5,8 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Overview
 
 This is a single-sketch Arduino project (`led-clock.ino`) targeting an ESP32-based board (Ozobot RVDKit). It
-implements I2C sensor discovery/polling, an RTC (DS3231) being read for time, and now also drives a MAX7219 LED
-matrix display (via SPI, independent of the I2C sensor bus) that shows the current time as read from the DS3231.
+implements I2C sensor discovery/polling, an RTC (DS3231) being read for time, drives a MAX7219 LED matrix display
+(via SPI, independent of the I2C sensor bus) that shows the current time as read from the DS3231, and connects to
+WiFi at boot via WiFiManager (captive-portal provisioning, credentials stored in NVS).
 
 ## Build / upload
 
@@ -80,6 +81,13 @@ All five sensors are driven through third-party Arduino libraries rather than ha
   of board target). Not gated behind a presence probe like the I2C sensors — it's on its own SPI-style bus, not the
   shared `Wire` bus.
 
+- **WiFiManager** (tzapu, `WiFiManager.h`, pulls in the ESP32 core `WiFi.h` and — because `WM_MDNS` is `#define`d
+  before the include — `ESPmDNS.h`) — `initWifi()` sets STA mode, then `wm.setHostname("led-clock")` and
+  `wm.autoConnect("led-clock")` with a 60s `setConfigPortalTimeout`; on failure to join a known network it serves a
+  captive portal from a `led-clock` AP. With `WM_MDNS` set, `setHostname()` also makes WiFiManager start an mDNS
+  responder, so the clock answers to `led-clock.local` (ESP32 runs mDNS in the background — no `loop()` tick needed).
+  Credentials persist in the ESP32 NVS (the library's own storage), so nothing in this sketch reads or writes them.
+
 ### Per-sensor sections
 
 The file is organized into clearly delimited sections (see the `// ----` banners), each following the same
@@ -127,6 +135,18 @@ The file is organized into clearly delimited sections (see the `// ----` banners
   brightness button on GPIO5; all three were dropped when merging — NTP/temperature because this project already has
   a real-time DS3231 and its own temperature sensors, and the button specifically because GPIO5 is `PIN_IRQ` on the
   ESP32-C3 variant and must stay reserved for the AS3935 interrupt.
+- **WiFi** — `initWifi()` (see WiFiManager under Sensor libraries above). Sets `WIFI_STA` mode, calls
+  `WiFiManager::setHostname("led-clock")` and `autoConnect("led-clock")` with a 60s config-portal timeout, recording
+  the outcome in the file-scope `wifiConnected` flag. `WM_MDNS` is `#define`d before the WiFiManager include, so the
+  device is also reachable at `led-clock.local` over mDNS. This is the one `initX()` that can block `setup()` for a
+  long time: if no known network is reachable the captive portal runs until the user configures WiFi or
+  `WIFI_MANAGER_TIMEOUT_S` elapses, and the clock display does not tick during that window. Nothing in `loop()` uses
+  `wifiConnected` yet — it's staged for NTP time sync.
+  When the connection succeeds, `setup()` calls `showIpOnMax7219()`, which scrolls `WiFi.localIP()` once
+  right-to-left across the whole four-module chain and then restores the clock layout. It does this by blanking the
+  left zone, widening zone 0 (`MAX7219_ZONE_RIGHT`) to span all `MAX7219_MAX_DEVICES` modules, running a
+  `PA_SCROLL_LEFT` in/out effect, and pumping `displayAnimate()` synchronously (`pumpMax7219UntilIdle()`, with a
+  timeout) until the scroll finishes, before calling `initMax7219Zones()` to put the two-zone HH / :MM layout back.
 
 ### Global sensor readings
 
@@ -145,7 +165,9 @@ planned features.
 ### Main loop
 
 `setup()` brings up `Wire`, runs a full `scan_i2c()` bus scan once, then calls each `initX()` (including
-`initMax7219()`). `loop()` no longer re-scans the I2C bus or blocks on a `delay()` — it services the AS3935 IRQ flag
+`initMax7219()` and, last, `initWifi()` — which can block on the WiFiManager config portal, see WiFi above — followed
+by `showIpOnMax7219()` when WiFi connected, which blocks while the IP address scrolls across the display once).
+`loop()` no longer re-scans the I2C bus or blocks on a `delay()` — it services the AS3935 IRQ flag
 and ticks the MAX7219 display (`pollMax7219()`) every iteration, and polls sensor readings on non-blocking
 `millis()`-based intervals: `SENSOR_POLL_INTERVAL_MS` (2000ms) for DS3231/AHT20/BMx280, and a separate
 `SGP30_MEASURE_INTERVAL_MS` (1000ms) timer for SGP30. The MAX7219 display keeps its own internal 1000ms timer

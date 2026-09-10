@@ -33,7 +33,10 @@
 
 #include <Wire.h>
 #include <SPI.h>
+#include <WiFi.h>
 
+#define WM_MDNS  // let WiFiManager start an mDNS responder for its hostname
+#include <WiFiManager.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <Adafruit_SGP30.h>
@@ -584,6 +587,85 @@ static void pollMax7219() {
 }
 
 // ---------------------------------------------------------------------
+// WiFi (WiFiManager captive-portal provisioning)
+//
+// WiFiManager keeps the last working credentials in the ESP32 NVS and
+// reconnects to them on boot. When it can't connect within
+// WIFI_MANAGER_TIMEOUT_S it starts a temporary "led-clock" access point
+// serving a captive configuration portal; initWifi() blocks in setup()
+// until the user enters credentials or the timeout expires. Nothing in
+// loop() depends on the connection yet -- wifiConnected is just recorded
+// for planned NTP time sync.
+//
+// With WM_MDNS defined (see the include above), setHostname() also makes
+// WiFiManager bring up an mDNS responder, so the clock is reachable as
+// "led-clock.local". ESP32's mDNS runs in the background -- no loop() tick
+// is needed to keep it alive.
+// ---------------------------------------------------------------------
+
+static const char WIFI_DEVICE_NAME[] = "led-clock";
+static const uint32_t WIFI_MANAGER_TIMEOUT_S = 60;
+
+static bool wifiConnected = false;
+
+static void initWifi() {
+  WiFi.mode(WIFI_STA);
+
+  WiFiManager wm;
+  wm.setHostname(WIFI_DEVICE_NAME);
+  wm.setConfigPortalTimeout(WIFI_MANAGER_TIMEOUT_S);
+  wifiConnected = wm.autoConnect(WIFI_DEVICE_NAME);
+  wm.stopWebPortal();
+
+  if (wifiConnected) {
+    log_printf("WiFi connected: SSID=%s, IP=%s, mDNS=%s.local\n",
+               WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(),
+               WIFI_DEVICE_NAME);
+  } else {
+    log_printf("WiFi not connected (config portal timed out)\n");
+  }
+}
+
+// Spin displayAnimate() until zone z finishes its current effect (or a
+// timeout), so a one-off animation can be run synchronously from setup().
+static void pumpMax7219UntilIdle(uint8_t z, uint32_t timeoutMs) {
+  uint32_t start = millis();
+  while (!maxDisplay.getZoneStatus(z) && millis() - start < timeoutMs) {
+    maxDisplay.displayAnimate();
+  }
+}
+
+// Scroll the DHCP-assigned IP address once across the whole four-module
+// chain, then restore the two-zone HH / :MM clock layout. Called from
+// setup() after WiFi connects -- the display is too narrow to show an IP
+// address all at once.
+static void showIpOnMax7219() {
+  String ip = WiFi.localIP().toString();
+  log_printf("MAX7219: scrolling IP %s\n", ip.c_str());
+
+  // Blank the left zone and let it settle so only zone 0 drives the chain
+  // while it is temporarily widened below.
+  maxDisplay.displayZoneText(MAX7219_ZONE_LEFT, "", PA_LEFT, 0, 0,
+                              PA_PRINT, PA_NO_EFFECT);
+  maxDisplay.displayReset(MAX7219_ZONE_LEFT);
+  pumpMax7219UntilIdle(MAX7219_ZONE_LEFT, 1000);
+
+  // Repurpose zone 0 to span every module for a single right-to-left scroll.
+  maxDisplay.setZone(MAX7219_ZONE_RIGHT, 0, MAX7219_MAX_DEVICES - 1);
+  maxDisplay.setIntensity(MAX7219_ZONE_RIGHT, max7219Brightness);
+  maxDisplay.displayClear();
+  // Parola keeps the text pointer, not a copy -- `ip` must outlive the scroll
+  // below, and it does (initMax7219Zones() swaps the pointer before return).
+  maxDisplay.displayZoneText(MAX7219_ZONE_RIGHT, ip.c_str(), PA_LEFT,
+                              MAX7219_SCROLL_SPEED, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+  maxDisplay.displayReset(MAX7219_ZONE_RIGHT);
+  pumpMax7219UntilIdle(MAX7219_ZONE_RIGHT, 30000);
+
+  maxDisplay.displayClear();
+  initMax7219Zones();
+}
+
+// ---------------------------------------------------------------------
 
 void setup() {
   Serial.begin(115200);
@@ -606,6 +688,11 @@ void setup() {
   initBmx280();
   initSgp30();
   initMax7219();
+  initWifi();
+
+  if (wifiConnected) {
+    showIpOnMax7219();
+  }
 }
 
 void scan_i2c()
