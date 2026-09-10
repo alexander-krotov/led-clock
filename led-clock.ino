@@ -38,6 +38,7 @@
 #include <Adafruit_BME280.h>
 #include <Adafruit_SGP30.h>
 #include <Adafruit_AHTX0.h>
+#include <SparkFun_AS3935.h>
 #include <DS3231.h>
 #include <MD_Parola.h>
 #include <MD_MAX72xx.h>
@@ -74,46 +75,6 @@ static const uint32_t SENSOR_POLL_INTERVAL_MS = 2000;
 // ---------------------------------------------------------------------
 
 static const uint8_t I2C_ADDR_NONE = 0xFF;
-
-static bool i2cReadBytes(uint8_t addr, uint8_t reg, uint8_t *buf, size_t len) {
-  Wire.beginTransmission(addr);
-  Wire.write(reg);
-  if (Wire.endTransmission(false) != 0) {
-    return false;
-  }
-  if (Wire.requestFrom((int)addr, (int)len) != (int)len) {
-    return false;
-  }
-  for (size_t i = 0; i < len; i++) {
-    buf[i] = Wire.read();
-  }
-  return true;
-}
-
-// For devices (e.g. AHT20) that reply with raw data instead of exposing
-// registers you address before reading.
-static bool i2cReadRaw(uint8_t addr, uint8_t *buf, size_t len) {
-  if (Wire.requestFrom((int)addr, (int)len) != (int)len) {
-    return false;
-  }
-  for (size_t i = 0; i < len; i++) {
-    buf[i] = Wire.read();
-  }
-  return true;
-}
-
-static uint8_t i2cReadReg(uint8_t addr, uint8_t reg) {
-  uint8_t value = 0xFF;
-  i2cReadBytes(addr, reg, &value, 1);
-  return value;
-}
-
-static void i2cWriteReg(uint8_t addr, uint8_t reg, uint8_t value) {
-  Wire.beginTransmission(addr);
-  Wire.write(reg);
-  Wire.write(value);
-  Wire.endTransmission();
-}
 
 static bool i2cProbe(uint8_t addr) {
   Wire.beginTransmission(addr);
@@ -193,19 +154,13 @@ static SensorReadings sensors;
 // AS3935 (WCMCU-3935 lightning sensor)
 // ---------------------------------------------------------------------
 
-// AS3935 register map (see AMS AS3935 datasheet, table 18)
-static const uint8_t REG_AFE_PWD    = 0x00;
-static const uint8_t REG_INT_SRC    = 0x03; // interrupt source, bits [3:0]
-static const uint8_t REG_ENERGY_LSB = 0x04;
-static const uint8_t REG_ENERGY_MSB = 0x05;
-static const uint8_t REG_ENERGY_MMSB = 0x06;
-static const uint8_t REG_DISTANCE   = 0x07;
-static const uint8_t REG_TRCO_CALIB = 0x3A;
-static const uint8_t REG_SRCO_CALIB = 0x3B;
-static const uint8_t CMD_PRESET_DEFAULT = 0x3C;
-static const uint8_t CMD_CALIB_RCO      = 0x3D;
+// The WCMCU-3935 board straps both address pins HIGH, giving I2C address
+// 0x03 (SparkFun's `defAddr`).
+static const i2cAddress AS3935_ADDR = defAddr;
 
-static uint8_t as3935Addr = 0x3;
+SparkFun_AS3935 as3935(AS3935_ADDR);
+
+static bool as3935Present = false;
 
 static volatile bool irqFired = false;
 
@@ -213,37 +168,23 @@ void IRAM_ATTR onAs3935Irq() {
   irqFired = true;
 }
 
-static bool calibrateAs3935() {
-  // Reset all registers to their power-on defaults.
-  i2cWriteReg(as3935Addr, CMD_PRESET_DEFAULT, 0x96);
-  delay(2);
-
-  // Calibrate the internal RC oscillators against the antenna LCO.
-  i2cWriteReg(as3935Addr, CMD_CALIB_RCO, 0x96);
-  delay(2);
-
-  uint8_t trco = i2cReadReg(as3935Addr, REG_TRCO_CALIB);
-  uint8_t srco = i2cReadReg(as3935Addr, REG_SRCO_CALIB);
-  bool trcoOk = (trco & 0x40) && !(trco & 0x20);
-  bool srcoOk = (srco & 0x40) && !(srco & 0x20);
-
-  log_printf("AS3935 calibration: TRCO reg=0x%02X (%s), SRCO reg=0x%02X (%s)\n",
-             trco, trcoOk ? "OK" : "FAILED",
-             srco, srcoOk ? "OK" : "FAILED");
-
-  return trcoOk && srcoOk;
-}
-
 static void initAs3935() {
-  log_printf("AS3935 found at I2C address 0x%02X\n", as3935Addr);
-
-  if (!calibrateAs3935()) {
-    log_printf("AS3935 calibration failed, readings may be unreliable\n");
+  if (!i2cProbe(AS3935_ADDR) || !as3935.begin(Wire)) {
+    log_printf("AS3935 not found at 0x%02X\n", AS3935_ADDR);
+    return;
   }
 
-  uint8_t afePwd = i2cReadReg(as3935Addr, REG_AFE_PWD);
-  log_printf("AS3935 status: REG0=0x%02X, PWD=%d, AFE_GB=%d\n",
-             afePwd, afePwd & 0x01, (afePwd >> 1) & 0x1F);
+  as3935.resetSettings();
+
+  // Calibrate the internal RC oscillators against the antenna LCO.
+  if (!as3935.calibrateOsc()) {
+    log_printf("AS3935 oscillator calibration failed, readings may be unreliable\n");
+  }
+
+  as3935.setIndoorOutdoor(INDOOR);
+
+  as3935Present = true;
+  log_printf("AS3935 found at I2C address 0x%02X\n", AS3935_ADDR);
 
   attachInterrupt(digitalPinToInterrupt(PIN_IRQ), onAs3935Irq, RISING);
 }
@@ -253,9 +194,14 @@ static void handleAs3935Irq() {
     return;
   }
   irqFired = false;
-  delay(2); // datasheet: wait 2ms after IRQ before reading the interrupt source
 
-  uint8_t intSrc = i2cReadReg(as3935Addr, REG_INT_SRC) & 0x0F;
+  if (!as3935Present) {
+    return;
+  }
+
+  // readInterruptReg() already waits the datasheet-mandated 2ms settle time
+  // before reading the interrupt source register.
+  uint8_t intSrc = as3935.readInterruptReg();
 
   sensors.as3935.valid      = true;
   sensors.as3935.updatedMs  = millis();
@@ -264,17 +210,15 @@ static void handleAs3935Irq() {
   sensors.as3935.energy     = 0;
 
   switch (intSrc) {
-    case 0x01:
+    case NOISE_TO_HIGH:
       log_printf("AS3935 IRQ: noise level too high\n");
       break;
-    case 0x04:
+    case DISTURBER_DETECT:
       log_printf("AS3935 IRQ: disturber detected\n");
       break;
-    case 0x08: {
-      uint8_t distance = i2cReadReg(as3935Addr, REG_DISTANCE) & 0x3F;
-      uint32_t energy = ((uint32_t)(i2cReadReg(as3935Addr, REG_ENERGY_MMSB) & 0x1F) << 16) |
-                         ((uint32_t)i2cReadReg(as3935Addr, REG_ENERGY_MSB) << 8) |
-                         i2cReadReg(as3935Addr, REG_ENERGY_LSB);
+    case LIGHTNING: {
+      uint8_t distance = as3935.distanceToStorm();
+      uint32_t energy = as3935.lightningEnergy();
       sensors.as3935.distanceKm = distance;
       sensors.as3935.energy     = energy;
       log_printf("AS3935 IRQ: lightning detected, distance=%u km, energy=%u\n",

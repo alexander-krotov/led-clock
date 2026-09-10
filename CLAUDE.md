@@ -33,23 +33,21 @@ Everything lives in `led-clock.ino`. The chip target is selected at compile time
 ### Shared I2C bus
 
 All five sensors sit on one I2C bus (`Wire`, pins `PIN_SDA`/`PIN_SCL`, 50kHz — lowered from the original 100kHz,
-with `Wire.setTimeOut(25)` also set, for SGP30 stability). Generic helpers
-(`i2cReadBytes`, `i2cReadRaw`, `i2cReadReg`, `i2cWriteReg`, `i2cProbe`, `i2cFindAddress`) wrap `Wire` calls. The
-AS3935 section (the only sensor without a maintained Arduino library) talks to its registers directly through these
-helpers; the other four sensors are driven through per-device libraries (see Sensor libraries below), but still use
+with `Wire.setTimeOut(25)` also set, for SGP30 stability). Two generic helpers (`i2cProbe`, `i2cFindAddress`) wrap
+`Wire` calls. All five sensors are driven through per-device libraries (see Sensor libraries below), but still use
 `i2cProbe`/`i2cFindAddress` for presence/address detection before handing off to the library, since none of those
 libraries scan the bus or report "not found" on their own in a way this sketch relies on.
 
-Because the AS3935 and BMP280/BME280 boards can have their I2C address strapped differently depending on the board,
-`setup()` probes candidate addresses for those two (`i2cFindAddress`) rather than assuming a fixed address, and for
-the BMx280 additionally reads back the chip ID (via `Adafruit_BME280::sensorID()`) to distinguish a BMP280 (0x58, no
-humidity) from a BME280 (0x60, has humidity) and picks the read path accordingly. DS3231 and AHT20 use fixed
-addresses (0x68, 0x38); the DS3231 library doesn't expose its address, so `DS3231_ADDR` is redeclared locally in the
-sketch just for the presence probe.
+Because the BMP280/BME280 board can have its I2C address strapped differently depending on the board, `setup()`
+probes both candidate addresses for it (`i2cFindAddress`) rather than assuming a fixed address, and for the BMx280
+additionally reads back the chip ID (via `Adafruit_BME280::sensorID()`) to distinguish a BMP280 (0x58, no
+humidity) from a BME280 (0x60, has humidity) and picks the read path accordingly. DS3231, AHT20 and AS3935 use fixed
+addresses (0x68, 0x38, 0x03); the DS3231 library doesn't expose its address, so `DS3231_ADDR` is redeclared locally
+in the sketch just for the presence probe.
 
 ### Sensor libraries
 
-Four of the five sensors are driven through third-party Arduino libraries rather than hand-rolled register access
+All five sensors are driven through third-party Arduino libraries rather than hand-rolled register access
 (install via Library Manager if missing):
 
 - **DS3231** (Eric Ayars' `DS3231` library, `DS3231.h`) — `DS3231 rtc;` with `rtc.getHour()/getMinute()/getSecond()/
@@ -68,9 +66,14 @@ Four of the five sensors are driven through third-party Arduino libraries rather
   `sgp.eCO2`/`sgp.TVOC` stale rather than updating them) followed by reading the `sgp.eCO2`/`sgp.TVOC` members.
 - **Adafruit Unified Sensor** (`Adafruit_Sensor.h`) — not a sensor driver itself, just the shared `sensors_event_t`/
   `Adafruit_Sensor` base type that AHTX0 and BME280 build on.
-
-The AS3935 has no such library in use here, so it stays on the raw `i2cReadReg`/`i2cWriteReg` helpers described
-above.
+- **SparkFun AS3935 Lightning Detector** (`SparkFun_AS3935.h`) — `SparkFun_AS3935 as3935(AS3935_ADDR);` constructed
+  with the fixed I2C address `defAddr` (0x03, the WCMCU-3935 board straps both address pins HIGH). `as3935.begin(Wire)`
+  returns whether the chip ACKs; `initAs3935()` still runs `i2cProbe(AS3935_ADDR)` first so a bus miss is reported the
+  same way as the other sensors. After `begin()` it calls `resetSettings()`, `calibrateOsc()` (RC oscillator
+  calibration against the antenna LCO — logs a warning on failure but continues), and `setIndoorOutdoor(INDOOR)`.
+  `handleAs3935Irq()` reads `readInterruptReg()` (which itself waits the datasheet-mandated 2ms settle time) and, on a
+  `LIGHTNING` result, `distanceToStorm()` / `lightningEnergy()`. The `NOISE_TO_HIGH` / `DISTURBER_DETECT` / `LIGHTNING`
+  enum values (0x01/0x04/0x08) come from the library header.
 
 - **MD_Parola** / **MD_MAX72xx** (both by MajicDesigns, `MD_Parola.h`/`MD_MAX72xx.h`) — drive the MAX7219 LED matrix
   display over bit-banged SPI (`PIN_MAX7219_DATA`/`PIN_MAX7219_CLK`/`PIN_MAX7219_CS`, fixed at GPIO7/6/10 regardless
@@ -82,10 +85,11 @@ above.
 The file is organized into clearly delimited sections (see the `// ----` banners), each following the same
 `initX()` / `readX()` (or `handleXIrq()`) pattern, gated by a `xPresent` bool set during `initX()`:
 
-- **AS3935 lightning sensor** — `initAs3935()` resets/recalibrates the RC oscillators (`calibrateAs3935`) and attaches
-  a `RISING`-edge interrupt on `PIN_IRQ` (`onAs3935Irq`, sets the `volatile irqFired` flag). `handleAs3935Irq()` is
-  polled from `loop()` and decodes the interrupt source register (noise / disturber / lightning-with-distance-and-energy).
-  Currently disabled — `initAs3935()` is commented out in `setup()`.
+- **AS3935 lightning sensor** — `initAs3935()` (using the SparkFun AS3935 library, see Sensor libraries above) probes
+  the bus, calls `as3935.begin()`, resets settings, recalibrates the RC oscillators (`calibrateOsc()`), selects the
+  indoor profile, sets the `as3935Present` flag, and attaches a `RISING`-edge interrupt on `PIN_IRQ` (`onAs3935Irq`,
+  sets the `volatile irqFired` flag). `handleAs3935Irq()` is polled from `loop()`, guarded by `as3935Present`, and
+  decodes the interrupt source (noise / disturber / lightning-with-distance-and-energy) through the library.
 - **DS3231 RTC** — `initDs3231()`/`readDs3231()`, using the `DS3231` library (see Sensor libraries above) rather than
   reading BCD time registers directly. `readDs3231()` also reads the chip's internal die temperature via
   `rtc.getTemperature()` and logs it alongside the time.
