@@ -5,9 +5,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Overview
 
 This is a single-sketch Arduino project (`led-clock.ino`) targeting an ESP32-based board (Ozobot RVDKit). It
-implements I2C sensor discovery/polling, an RTC (DS3231) being read for time, drives a MAX7219 LED matrix display
-(via SPI, independent of the I2C sensor bus) that shows the current time as read from the DS3231, and connects to
-WiFi at boot via WiFiManager (captive-portal provisioning, credentials stored in NVS).
+implements I2C sensor discovery/polling, an RTC (DS3231) used as the time source, drives a MAX7219 LED matrix
+display (via SPI, independent of the I2C sensor bus) that shows the current time as read from the DS3231, connects to
+WiFi at boot via WiFiManager (captive-portal provisioning, credentials stored in NVS), and keeps the DS3231
+disciplined to an NTP server (name + UTC offset configurable in the portal, persisted in EEPROM).
 
 ## Build / upload
 
@@ -84,9 +85,14 @@ All five sensors are driven through third-party Arduino libraries rather than ha
 - **WiFiManager** (tzapu, `WiFiManager.h`, pulls in the ESP32 core `WiFi.h` and — because `WM_MDNS` is `#define`d
   before the include — `ESPmDNS.h`) — `initWifi()` sets STA mode, then `wm.setHostname("led-clock")` and
   `wm.autoConnect("led-clock")` with a 60s `setConfigPortalTimeout`; on failure to join a known network it serves a
-  captive portal from a `led-clock` AP. With `WM_MDNS` set, `setHostname()` also makes WiFiManager start an mDNS
-  responder, so the clock answers to `led-clock.local` (ESP32 runs mDNS in the background — no `loop()` tick needed).
-  Credentials persist in the ESP32 NVS (the library's own storage), so nothing in this sketch reads or writes them.
+  captive portal from a `led-clock` AP. Two `WiFiManagerParameter`s (`"ntp"`, `"utc"`) are added to the portal so
+  the NTP server name and UTC offset can be entered alongside the WiFi credentials; `setSaveParamsCallback` copies
+  them into `ntpServer` / `utcOffsetHours` and calls `saveConfig()`. With `WM_MDNS` set, `setHostname()` also makes
+  WiFiManager start an mDNS responder, so the clock answers to `led-clock.local` (ESP32 runs mDNS in the background —
+  no `loop()` tick needed). WiFi credentials persist in the ESP32 NVS (the library's own storage), separate from the
+  sketch's own EEPROM config.
+- **`EEPROM.h`** / **`WiFiUdp.h`** (ESP32 core) — `EEPROM` backs the persistent NTP config (see the EEPROM section
+  below); `WiFiUDP` carries the SNTP request in the NTP section.
 
 ### Per-sensor sections
 
@@ -132,21 +138,34 @@ The file is organized into clearly delimited sections (see the `// ----` banners
   idle again. Unlike the other sections there's no presence flag — the display isn't probed, and `pollMax7219()` only
   skips the RTC read (not the animation tick, needed for smooth scrolling) when `ds3231Present` is false. This section was
   adapted from a standalone example sketch that also had NTP time sync, temperature display, and a physical
-  brightness button on GPIO5; all three were dropped when merging — NTP/temperature because this project already has
-  a real-time DS3231 and its own temperature sensors, and the button specifically because GPIO5 is `PIN_IRQ` on the
-  ESP32-C3 variant and must stay reserved for the AS3935 interrupt.
+  brightness button on GPIO5; all three were dropped when merging — temperature because this project has its own
+  sensors, the button because GPIO5 is `PIN_IRQ` on the ESP32-C3 variant and must stay reserved for the AS3935
+  interrupt, and NTP because the DS3231 was the time source (NTP has since been re-added as its own section, keeping
+  the DS3231 as the source and just disciplining it).
+- **Persistent config (EEPROM)** — `loadConfig()` / `saveConfig()`, run over the ESP32 EEPROM emulation
+  (`EEPROM.begin(EEPROM_SIZE)` first thing in `setup()`). Layout is a magic byte (`EEPROM_MAGIC`, detects an
+  uninitialized/foreign partition), an `int8_t` UTC offset, and a fixed-length NUL-terminated `ntpServer[]` byte
+  array (written/read with `EEPROM.writeBytes`/`readBytes`). `loadConfig()` seeds the defaults (`"fi.pool.ntp.org"`,
+  offset 0) on first boot; the only other writer is the WiFiManager save-params callback.
 - **WiFi** — `initWifi()` (see WiFiManager under Sensor libraries above). Sets `WIFI_STA` mode, calls
   `WiFiManager::setHostname("led-clock")` and `autoConnect("led-clock")` with a 60s config-portal timeout, recording
-  the outcome in the file-scope `wifiConnected` flag. `WM_MDNS` is `#define`d before the WiFiManager include, so the
-  device is also reachable at `led-clock.local` over mDNS. This is the one `initX()` that can block `setup()` for a
-  long time: if no known network is reachable the captive portal runs until the user configures WiFi or
-  `WIFI_MANAGER_TIMEOUT_S` elapses, and the clock display does not tick during that window. Nothing in `loop()` uses
-  `wifiConnected` yet — it's staged for NTP time sync.
+  the outcome in the file-scope `wifiConnected` flag. It also registers the `"ntp"` / `"utc"` portal parameters and a
+  save callback (see WiFiManager above). `WM_MDNS` is `#define`d before the WiFiManager include, so the device is also
+  reachable at `led-clock.local` over mDNS. This is the one `initX()` that can block `setup()` for a long time: if no
+  known network is reachable the captive portal runs until the user configures WiFi or `WIFI_MANAGER_TIMEOUT_S`
+  elapses, and the clock display does not tick during that window.
   When the connection succeeds, `setup()` calls `showIpOnMax7219()`, which scrolls `WiFi.localIP()` once
   right-to-left across the whole four-module chain and then restores the clock layout. It does this by blanking the
   left zone, widening zone 0 (`MAX7219_ZONE_RIGHT`) to span all `MAX7219_MAX_DEVICES` modules, running a
   `PA_SCROLL_LEFT` in/out effect, and pumping `displayAnimate()` synchronously (`pumpMax7219UntilIdle()`, with a
   timeout) until the scroll finishes, before calling `initMax7219Zones()` to put the two-zone HH / :MM layout back.
+- **NTP time sync** — `fetchNtpEpoch()` / `syncNtp()`. `fetchNtpEpoch()` does one SNTPv4 request to `ntpServer` over
+  `WiFiUDP` with a ~1.5s timeout and returns the UTC epoch (0 on failure or an implausibly-early timestamp).
+  `syncNtp()` adds `utcOffsetHours` and writes the result to the DS3231 with `rtc.setEpoch(..., false)` (+
+  `setClockMode(false)` for 24h) — the DS3231 stays the single time source the display reads, NTP only corrects its
+  drift. `loop()` calls `syncNtp()` on its first pass, then every `NTP_SYNC_INTERVAL_MS` (1h) once a sync has
+  succeeded, or every `NTP_RETRY_INTERVAL_MS` (5min) while it is failing; the blocking UDP exchange stalls `loop()`
+  (and the display animation) for up to ~1.5s each time.
 
 ### Global sensor readings
 
@@ -164,12 +183,13 @@ planned features.
 
 ### Main loop
 
-`setup()` brings up `Wire`, runs a full `scan_i2c()` bus scan once, then calls each `initX()` (including
-`initMax7219()` and, last, `initWifi()` — which can block on the WiFiManager config portal, see WiFi above — followed
-by `showIpOnMax7219()` when WiFi connected, which blocks while the IP address scrolls across the display once).
-`loop()` no longer re-scans the I2C bus or blocks on a `delay()` — it services the AS3935 IRQ flag
-and ticks the MAX7219 display (`pollMax7219()`) every iteration, and polls sensor readings on non-blocking
-`millis()`-based intervals: `SENSOR_POLL_INTERVAL_MS` (2000ms) for DS3231/AHT20/BMx280, and a separate
-`SGP30_MEASURE_INTERVAL_MS` (1000ms) timer for SGP30. The MAX7219 display keeps its own internal 1000ms timer
-(inside `pollMax7219()`) for pushing a fresh HH:MM, decoupled from both of the above since it must also tick Parola's
-animation every loop iteration regardless of that timer.
+`setup()` runs `EEPROM.begin()` + `loadConfig()`, brings up `Wire`, runs a full `scan_i2c()` bus scan once, then
+calls each `initX()` (including `initMax7219()` and, last, `initWifi()` — which can block on the WiFiManager config
+portal, see WiFi above — followed by `showIpOnMax7219()` when WiFi connected, which blocks while the IP address
+scrolls across the display once). `loop()` no longer re-scans the I2C bus or blocks on a `delay()` — it services the
+AS3935 IRQ flag and ticks the MAX7219 display (`pollMax7219()`) every iteration, and polls on non-blocking
+`millis()`-based intervals: `SENSOR_POLL_INTERVAL_MS` (2000ms) for DS3231/AHT20/BMx280, a separate
+`SGP30_MEASURE_INTERVAL_MS` (1000ms) timer for SGP30, and `NTP_SYNC_INTERVAL_MS` / `NTP_RETRY_INTERVAL_MS` for
+`syncNtp()` (see NTP above). The MAX7219 display keeps its own internal 1000ms timer (inside `pollMax7219()`) for
+pushing a fresh HH:MM, decoupled from all of the above since it must also tick Parola's animation every loop
+iteration regardless of that timer.

@@ -30,10 +30,13 @@
  */
 
 #include <string.h>
+#include <time.h>
 
 #include <Wire.h>
 #include <SPI.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
+#include <EEPROM.h>
 
 #define WM_MDNS  // let WiFiManager start an mDNS responder for its hostname
 #include <WiFiManager.h>
@@ -587,15 +590,66 @@ static void pollMax7219() {
 }
 
 // ---------------------------------------------------------------------
+// Persistent configuration (EEPROM)
+//
+// The ESP32 EEPROM library emulates a small EEPROM in a flash partition;
+// EEPROM.begin(EEPROM_SIZE) must run once in setup() before any access.
+// Layout: a magic byte to detect an uninitialized/foreign partition, the
+// UTC offset (int8_t hours), then the NTP server name as a fixed-length,
+// NUL-terminated byte array. loadConfig() seeds the defaults on first
+// boot; the WiFiManager save-params callback (see initWifi) calls
+// saveConfig() when the user edits either field in the portal.
+// ---------------------------------------------------------------------
+
+static const int     EEPROM_SIZE        = 128;
+static const int     EEPROM_MAGIC_ADDR  = 0;
+static const int     EEPROM_TZ_ADDR     = 1;   // int8_t, UTC offset in hours
+static const int     EEPROM_NTP_ADDR    = 2;   // char[NTP_SERVER_MAXLEN]
+static const uint8_t EEPROM_MAGIC       = 0x37;
+
+static const size_t  NTP_SERVER_MAXLEN  = 64;
+
+static char   ntpServer[NTP_SERVER_MAXLEN] = "fi.pool.ntp.org";
+static int8_t utcOffsetHours              = 0;
+
+static void saveConfig() {
+  EEPROM.write(EEPROM_MAGIC_ADDR, EEPROM_MAGIC);
+  EEPROM.write(EEPROM_TZ_ADDR, (uint8_t)utcOffsetHours);
+  EEPROM.writeBytes(EEPROM_NTP_ADDR, ntpServer, NTP_SERVER_MAXLEN);
+  EEPROM.commit();
+  log_printf("config saved: ntpServer=%s, utcOffset=%dh\n", ntpServer, utcOffsetHours);
+}
+
+static void loadConfig() {
+  if (EEPROM.read(EEPROM_MAGIC_ADDR) != EEPROM_MAGIC) {
+    log_printf("config: EEPROM not initialized, writing defaults\n");
+    saveConfig();
+    return;
+  }
+
+  utcOffsetHours = (int8_t)EEPROM.read(EEPROM_TZ_ADDR);
+  EEPROM.readBytes(EEPROM_NTP_ADDR, ntpServer, NTP_SERVER_MAXLEN);
+  ntpServer[NTP_SERVER_MAXLEN - 1] = '\0';
+  if (ntpServer[0] == '\0') {
+    strncpy(ntpServer, "fi.pool.ntp.org", NTP_SERVER_MAXLEN - 1);
+  }
+  log_printf("config loaded: ntpServer=%s, utcOffset=%dh\n", ntpServer, utcOffsetHours);
+}
+
+// ---------------------------------------------------------------------
 // WiFi (WiFiManager captive-portal provisioning)
 //
 // WiFiManager keeps the last working credentials in the ESP32 NVS and
 // reconnects to them on boot. When it can't connect within
 // WIFI_MANAGER_TIMEOUT_S it starts a temporary "led-clock" access point
 // serving a captive configuration portal; initWifi() blocks in setup()
-// until the user enters credentials or the timeout expires. Nothing in
-// loop() depends on the connection yet -- wifiConnected is just recorded
-// for planned NTP time sync.
+// until the user enters credentials or the timeout expires.
+//
+// The portal also carries two custom fields -- the NTP server name and
+// the UTC offset -- so both can be set alongside the WiFi credentials.
+// WiFiManager only shows the portal when it can't auto-connect, so these
+// fields are editable at first setup (or whenever WiFi is reconfigured);
+// otherwise the values persisted in EEPROM are used as-is.
 //
 // With WM_MDNS defined (see the include above), setHostname() also makes
 // WiFiManager bring up an mDNS responder, so the clock is reachable as
@@ -614,6 +668,20 @@ static void initWifi() {
   WiFiManager wm;
   wm.setHostname(WIFI_DEVICE_NAME);
   wm.setConfigPortalTimeout(WIFI_MANAGER_TIMEOUT_S);
+
+  char utcOffsetStr[6];
+  snprintf(utcOffsetStr, sizeof(utcOffsetStr), "%d", utcOffsetHours);
+  WiFiManagerParameter ntpParam("ntp", "NTP server", ntpServer, NTP_SERVER_MAXLEN - 1);
+  WiFiManagerParameter utcParam("utc", "UTC offset (hours)", utcOffsetStr, 5);
+  wm.addParameter(&ntpParam);
+  wm.addParameter(&utcParam);
+  wm.setSaveParamsCallback([&]() {
+    strncpy(ntpServer, ntpParam.getValue(), NTP_SERVER_MAXLEN - 1);
+    ntpServer[NTP_SERVER_MAXLEN - 1] = '\0';
+    utcOffsetHours = (int8_t)atoi(utcParam.getValue());
+    saveConfig();
+  });
+
   wifiConnected = wm.autoConnect(WIFI_DEVICE_NAME);
   wm.stopWebPortal();
 
@@ -666,6 +734,87 @@ static void showIpOnMax7219() {
 }
 
 // ---------------------------------------------------------------------
+// NTP time sync
+//
+// Once WiFi is up, syncNtp() asks the configured NTP server (SNTPv4 over
+// UDP, one request, ~1.5s timeout) for the current UTC, adds the
+// configured utcOffsetHours, and writes the result to the DS3231 with
+// rtc.setEpoch(). The DS3231 stays the single time source the display
+// reads from -- NTP just corrects its drift. loop() runs the first sync
+// on its first pass and then re-syncs every NTP_SYNC_INTERVAL_MS, backing
+// off to NTP_RETRY_INTERVAL_MS while a sync is failing. The UDP exchange
+// blocks loop() for up to ~1.5s while it runs.
+// ---------------------------------------------------------------------
+
+static const uint16_t NTP_LOCAL_PORT       = 8888;
+static const uint32_t NTP_SYNC_INTERVAL_MS  = 60UL * 60 * 1000;  // hourly when healthy
+static const uint32_t NTP_RETRY_INTERVAL_MS = 5UL * 60 * 1000;   // sooner after a failure
+static const uint32_t NTP_UNIX_EPOCH_DIFF   = 2208988800UL;      // 1900 -> 1970
+
+static WiFiUDP ntpUdp;
+
+// Returns UTC epoch seconds from the configured NTP server, or 0 on failure.
+static uint32_t fetchNtpEpoch() {
+  IPAddress serverIp;
+  if (!WiFi.hostByName(ntpServer, serverIp)) {
+    log_printf("NTP: DNS lookup for %s failed\n", ntpServer);
+    return 0;
+  }
+
+  uint8_t pkt[48] = {0};
+  pkt[0] = 0b11100011;  // LI = 3 (unsynchronized), VN = 4, Mode = 3 (client)
+  pkt[1] = 0;           // stratum
+  pkt[2] = 6;           // polling interval
+  pkt[3] = 0xEC;        // peer clock precision
+  pkt[12] = 49; pkt[13] = 0x4E; pkt[14] = 49; pkt[15] = 52;  // reference id
+
+  ntpUdp.begin(NTP_LOCAL_PORT);
+  while (ntpUdp.parsePacket() > 0) {
+    /* drain any stale datagrams */
+  }
+  ntpUdp.beginPacket(serverIp, 123);
+  ntpUdp.write(pkt, sizeof(pkt));
+  ntpUdp.endPacket();
+
+  uint32_t deadline = millis() + 1500;
+  while ((int32_t)(deadline - millis()) > 0) {
+    if (ntpUdp.parsePacket() >= (int)sizeof(pkt)) {
+      ntpUdp.read(pkt, sizeof(pkt));
+      ntpUdp.stop();
+      uint32_t secsSince1900 = ((uint32_t)pkt[40] << 24) | ((uint32_t)pkt[41] << 16) |
+                               ((uint32_t)pkt[42] << 8)  |  (uint32_t)pkt[43];
+      uint32_t epoch = secsSince1900 - NTP_UNIX_EPOCH_DIFF;
+      if (epoch < 1577836800UL) {  // before 2020-01-01 -> implausible reply
+        log_printf("NTP: implausible timestamp from %s\n", ntpServer);
+        return 0;
+      }
+      return epoch;
+    }
+  }
+
+  ntpUdp.stop();
+  log_printf("NTP: no response from %s\n", ntpServer);
+  return 0;
+}
+
+static bool syncNtp() {
+  if (!WiFi.isConnected() || !ds3231Present) {
+    return false;
+  }
+
+  uint32_t utc = fetchNtpEpoch();
+  if (utc == 0) {
+    return false;
+  }
+
+  rtc.setEpoch((time_t)utc + (int32_t)utcOffsetHours * 3600, false);
+  rtc.setClockMode(false);  // 24-hour
+  log_printf("NTP: DS3231 set from %s (UTC epoch %lu, offset %dh)\n",
+             ntpServer, (unsigned long)utc, utcOffsetHours);
+  return true;
+}
+
+// ---------------------------------------------------------------------
 
 void setup() {
   Serial.begin(115200);
@@ -680,8 +829,11 @@ void setup() {
   delay(1000);
   log_printf("Starting\n");
 
+  EEPROM.begin(EEPROM_SIZE);
+  loadConfig();
+
   scan_i2c();
-  
+
   initAs3935();
   initDs3231();
   initAht20();
@@ -732,5 +884,13 @@ void loop() {
   if (now - lastSgp30Poll >= SGP30_MEASURE_INTERVAL_MS) {
     lastSgp30Poll = now;
     readSgp30();
+  }
+
+  static uint32_t lastNtpAttempt = 0;
+  static bool lastNtpOk = false;
+  uint32_t ntpInterval = lastNtpOk ? NTP_SYNC_INTERVAL_MS : NTP_RETRY_INTERVAL_MS;
+  if (wifiConnected && (lastNtpAttempt == 0 || now - lastNtpAttempt >= ntpInterval)) {
+    lastNtpAttempt = now;
+    lastNtpOk = syncNtp();
   }
 }
