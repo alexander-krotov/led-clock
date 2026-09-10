@@ -109,14 +109,19 @@ The file is organized into clearly delimited sections (see the `// ----` banners
   the sensor's dynamic baseline compensation to stay accurate.
 - **MAX7219 LED matrix clock display** — `initMax7219()`/`pollMax7219()`, using MD_Parola/MD_MAX72xx (see Sensor
   libraries above). Four 8x8 modules are split into two MD_Parola zones (`MAX7219_NUM_ZONES` = 2): the left zone
-  (`MAX7219_ZONE_LEFT` = 1, modules 2-3) shows the string `"HH:"` right-aligned, the right zone
-  (`MAX7219_ZONE_RIGHT` = 0, modules 0-1) shows `":MM"` left-aligned, so the two `:` glyphs meet in the middle of the
-  chain and read as the HH:MM separator (no hand-drawn colon any more). Both zones are fed from the DS3231 RTC
+  (`MAX7219_ZONE_LEFT` = 1, modules 2-3) shows `"HH"` right-aligned, the right zone (`MAX7219_ZONE_RIGHT` = 0,
+  modules 0-1) shows `":MM"` left-aligned, so the colon (the right zone's leading glyph) sits at the middle of the
+  chain and reads as the HH:MM separator (no hand-drawn colon any more). Both zones are fed from the DS3231 RTC
   (`rtc.getHour()`/`getMinute()`) once a second; a zone whose text changed scrolls the new text down
   (`PA_SCROLL_DOWN`) while the other stays static (`PA_PRINT`/`PA_NO_EFFECT`). Per-zone alignment is stored in
   `Max7219ZoneState.align` and reused for the static redraw. Parola keeps a pointer to (not a copy of) the text it is
   shown, so each zone's `current`/`next` char buffers live in the file-scope `max7219Zones[]` array rather than on
-  the stack. Unlike the other sections there's no presence flag — the display isn't probed, and `pollMax7219()` only
+  the stack. Because MD_Parola only positions text at whole-module (8px) granularity, `"HH"` would otherwise be flush
+  against the colon; `applyMax7219LeftNudge()` shifts the left zone's two modules `MAX7219_LEFT_NUDGE_COLS` (1)
+  column(s) sideways with `MD_MAX72xx::transform()` (direction `MAX7219_LEFT_NUDGE_XFORM`, `TSL`/`TSR` depending on
+  module wiring) to open a small gap before the colon. The shift has to be redone after every static redraw of the
+  zone, so `max7219LeftNudgePending` is set on each redraw and `pollMax7219()` re-applies the nudge once the zone is
+  idle again. Unlike the other sections there's no presence flag — the display isn't probed, and `pollMax7219()` only
   skips the RTC read (not the animation tick, needed for smooth scrolling) when `ds3231Present` is false. This section was
   adapted from a standalone example sketch that also had NTP time sync, temperature display, and a physical
   brightness button on GPIO5; all three were dropped when merging — NTP/temperature because this project already has

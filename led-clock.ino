@@ -437,6 +437,15 @@ static void readSgp30() {
 static uint8_t max7219Brightness = 4;            // MAX7219 range 0-15, runtime-adjustable
 static const uint32_t MAX7219_SCROLL_SPEED = 40; // ms per scroll frame
 
+// MD_Parola only positions text at whole-module (8px) granularity, so the
+// left zone's "HH" ends up flush against the colon (the first glyph of the
+// right zone). After each static redraw of the left zone its two modules'
+// pixels are shifted this many columns to open a gap before the colon.
+static const uint8_t MAX7219_LEFT_NUDGE_COLS = 1;
+// Shift direction: TSL moves the digits away from the colon. If they move
+// the wrong way (into the right zone) on your module wiring, use TSR.
+static const MD_MAX72XX::transformType_t MAX7219_LEFT_NUDGE_XFORM = MD_MAX72XX::TSL;
+
 MD_Parola maxDisplay(MAX7219_HARDWARE_TYPE, PIN_MAX7219_DATA, PIN_MAX7219_CLK,
                       PIN_MAX7219_CS, MAX7219_MAX_DEVICES);
 
@@ -448,6 +457,11 @@ struct Max7219ZoneState {
 };
 
 Max7219ZoneState max7219Zones[MAX7219_NUM_ZONES];
+
+// Set when the left zone has just been drawn as static text and still needs
+// its column nudge re-applied (each redraw starts from the module-aligned
+// position and overwrites the previous shift).
+static bool max7219LeftNudgePending = false;
 
 static void initMax7219Zones() {
   maxDisplay.setZone(MAX7219_ZONE_RIGHT, 0, 1);
@@ -470,6 +484,19 @@ static void initMax7219Zones() {
     maxDisplay.displayZoneText(z, max7219Zones[z].current, max7219Zones[z].align,
                                 MAX7219_SCROLL_SPEED, 0, PA_PRINT, PA_NO_EFFECT);
   }
+
+  max7219LeftNudgePending = true;
+}
+
+// Shift the left zone (modules 2-3) sideways by MAX7219_LEFT_NUDGE_COLS so
+// its "HH" is not flush against the colon. Must run after every static
+// redraw of that zone, since Parola redraws it module-aligned.
+static void applyMax7219LeftNudge() {
+  MD_MAX72XX *mx = maxDisplay.getGraphicObject();
+  for (uint8_t i = 0; i < MAX7219_LEFT_NUDGE_COLS; i++) {
+    mx->transform(2, 3, MAX7219_LEFT_NUDGE_XFORM);
+  }
+  mx->update();
 }
 
 static void triggerMax7219ScrollDown(uint8_t z, const char *text) {
@@ -523,7 +550,18 @@ static void pollMax7219() {
       maxDisplay.displayZoneText(z, max7219Zones[z].current, max7219Zones[z].align,
                                   MAX7219_SCROLL_SPEED, 0, PA_PRINT, PA_NO_EFFECT);
       maxDisplay.displayReset(z);
+      if (z == MAX7219_ZONE_LEFT) {
+        max7219LeftNudgePending = true;
+      }
     }
+  }
+
+  // Re-apply the left-zone column nudge once the zone is idle again.
+  if (max7219LeftNudgePending &&
+      !max7219Zones[MAX7219_ZONE_LEFT].scrolling &&
+      maxDisplay.getZoneStatus(MAX7219_ZONE_LEFT)) {
+    applyMax7219LeftNudge();
+    max7219LeftNudgePending = false;
   }
 
   if (!ds3231Present) {
