@@ -13,6 +13,7 @@
 #   MCP_HOST=led-clock.local:8080 bash test/mcp-test.sh
 #   bash test/mcp-test.sh --set-offset 3         # also exercise set_ntp_config (offset)
 #   bash test/mcp-test.sh --set-server fi.pool.ntp.org
+#   bash test/mcp-test.sh --set-brightness 6     # also exercise set_display_brightness
 #
 # Exit status is 0 only if every check passes. --set-* options write persistent
 # config on the device, so leave them off for a read-only run.
@@ -22,15 +23,17 @@ set -u
 HOST="${MCP_HOST:-led-clock.local:8080}"
 SET_OFFSET=""
 SET_SERVER=""
+SET_BRIGHTNESS=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help)
-      sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//; s/^#$//'
+      sed -n '3,19p' "$0" | sed 's/^# \{0,1\}//; s/^#$//'
       exit 0
       ;;
-    --set-offset) SET_OFFSET="${2:-}"; shift 2 ;;
-    --set-server) SET_SERVER="${2:-}"; shift 2 ;;
+    --set-offset)     SET_OFFSET="${2:-}"; shift 2 ;;
+    --set-server)     SET_SERVER="${2:-}"; shift 2 ;;
+    --set-brightness) SET_BRIGHTNESS="${2:-}"; shift 2 ;;
     -*) echo "unknown option: $1" >&2; exit 2 ;;
     *)  HOST="$1"; shift ;;
   esac
@@ -155,6 +158,18 @@ rpc "get_sensors" \
 rpc "get_ds3231_time" \
     "tools/call" '{"name":"get_ds3231_time","arguments":{}}' tool-ok
 
+rpc "get_ntp_config" \
+    "tools/call" '{"name":"get_ntp_config","arguments":{}}' tool-ok
+
+rpc "get_display_brightness" \
+    "tools/call" '{"name":"get_display_brightness","arguments":{}}' tool-ok
+
+rpc "set_display_brightness (missing arg -> isError)" \
+    "tools/call" '{"name":"set_display_brightness","arguments":{}}' tool-error
+
+rpc "set_display_brightness (out of range -> isError)" \
+    "tools/call" '{"name":"set_display_brightness","arguments":{"brightness":99}}' tool-error
+
 rpc "unknown tool -> isError" \
     "tools/call" '{"name":"does_not_exist","arguments":{}}' tool-error
 
@@ -173,6 +188,12 @@ fi
 if [ -n "$SET_SERVER" ]; then
   rpc "set_ntp_config ntp_server=${SET_SERVER}" \
       "tools/call" "{\"name\":\"set_ntp_config\",\"arguments\":{\"ntp_server\":\"${SET_SERVER}\"}}" \
+      tool-ok
+fi
+
+if [ -n "$SET_BRIGHTNESS" ]; then
+  rpc "set_display_brightness ${SET_BRIGHTNESS}" \
+      "tools/call" "{\"name\":\"set_display_brightness\",\"arguments\":{\"brightness\":${SET_BRIGHTNESS}}}" \
       tool-ok
 fi
 

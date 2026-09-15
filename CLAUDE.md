@@ -9,7 +9,8 @@ implements I2C sensor discovery/polling, an RTC (DS3231) used as the time source
 display (via SPI, independent of the I2C sensor bus) that shows the current time as read from the DS3231, connects to
 WiFi at boot via WiFiManager (captive-portal provisioning, credentials stored in NVS), keeps the DS3231 disciplined
 to an NTP server (name + UTC offset configurable in the portal, persisted in EEPROM), and exposes an unauthenticated
-MCP (Model Context Protocol) HTTP endpoint for reading the sensors / RTC and changing the NTP config.
+MCP (Model Context Protocol) HTTP endpoint for reading the sensors / RTC / config and changing the NTP config and
+display brightness.
 
 ## Build / upload
 
@@ -155,9 +156,12 @@ The file is organized into clearly delimited sections (see the `// ----` banners
   the DS3231 as the source and just disciplining it).
 - **Persistent config (EEPROM)** — `loadConfig()` / `saveConfig()`, run over the ESP32 EEPROM emulation
   (`EEPROM.begin(EEPROM_SIZE)` first thing in `setup()`). Layout is a magic byte (`EEPROM_MAGIC`, detects an
-  uninitialized/foreign partition), an `int8_t` UTC offset, and a fixed-length NUL-terminated `ntpServer[]` byte
-  array (written/read with `EEPROM.writeBytes`/`readBytes`). `loadConfig()` seeds the defaults (`"fi.pool.ntp.org"`,
-  offset 0) on first boot; the only other writer is the WiFiManager save-params callback.
+  uninitialized/foreign partition), an `int8_t` UTC offset, a fixed-length NUL-terminated `ntpServer[]` byte array
+  (written/read with `EEPROM.writeBytes`/`readBytes`), and a `uint8_t` display brightness (`EEPROM_BRIGHTNESS_ADDR`,
+  0..15). `loadConfig()` seeds the defaults (`"fi.pool.ntp.org"`, offset 0, brightness 4) on first boot and, since
+  the brightness byte was added without bumping `EEPROM_MAGIC`, treats an out-of-range value (e.g. `0xFF` from an
+  older layout) as "use the default". Writers: the WiFiManager save-params callback and the MCP `set_ntp_config` /
+  `set_display_brightness` tools.
 - **WiFi** — `initWifi()` (see WiFiManager under Sensor libraries above). Sets `WIFI_STA` mode, calls
   `WiFiManager::setHostname("led-clock")` and `autoConnect("led-clock")` with a 60s config-portal timeout, recording
   the outcome in the file-scope `wifiConnected` flag. It also registers the `"ntp"` / `"utc"` portal parameters and a
@@ -183,10 +187,12 @@ The file is organized into clearly delimited sections (see the `// ----` banners
   handlers run in the loop task and may touch I2C / flash directly (nothing else in `loop()` overlaps a request).
   `initialize` / `ping` / `tools/list` / `tools/call` are dispatched in `handleMcpPost` (`notifications/*` get a bare
   `202`); responses are always `application/json`, never SSE; the request body comes from `mcpServer.arg("plain")`.
-  Three tools: `get_sensors` (dumps the `sensors` struct via `mcpFillSensors`), `get_ds3231_time` (reads the RTC
-  live), and `set_ntp_config` (`ntp_server` / `utc_offset_hours` args — validated, applied, `saveConfig()`'d, then
-  `ntpLastAttemptMs` is cleared to force an immediate NTP re-sync). Every tool result carries both a `content` text
-  block and a `structuredContent` object.
+  Tools: `get_sensors` (dumps the `sensors` struct via `mcpFillSensors`), `get_ds3231_time` (reads the RTC live),
+  `get_ntp_config` / `set_ntp_config` (`ntp_server`, `utc_offset_hours`; a set validates, applies, `saveConfig()`s,
+  then clears `ntpLastAttemptMs` to force an immediate NTP re-sync — a get also reports `last_sync_ok`), and
+  `get_display_brightness` / `set_display_brightness` (`brightness` 0..15, applied via `setMax7219Brightness()` and
+  persisted). The `get_*` / `set_*` responses share a `mcpFill*` builder. Every tool result carries both a `content`
+  text block and a `structuredContent` object.
 
 ### Global sensor readings
 

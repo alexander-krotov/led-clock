@@ -442,7 +442,10 @@ static void readSgp30() {
 #define MAX7219_ZONE_RIGHT    0  // modules 0-1, ":MM", left-aligned
 #define MAX7219_ZONE_LEFT     1  // modules 2-3, "HH:", right-aligned
 
-static uint8_t max7219Brightness = 4;            // MAX7219 range 0-15, runtime-adjustable
+static const uint8_t MAX7219_BRIGHTNESS_MAX     = 15;  // MAX7219 hardware intensity range is 0..15
+static const uint8_t MAX7219_BRIGHTNESS_DEFAULT = 4;
+static uint8_t max7219Brightness = MAX7219_BRIGHTNESS_DEFAULT;  // 0..15, loaded from / saved to EEPROM
+
 static const uint32_t MAX7219_SCROLL_SPEED = 40; // ms per scroll frame
 
 // MD_Parola only positions text at whole-module (8px) granularity, so the
@@ -544,6 +547,16 @@ static void initMax7219() {
   initMax7219Zones();
 }
 
+// Set the display intensity (0..MAX7219_BRIGHTNESS_MAX) on every zone and
+// record it in max7219Brightness. Persisting is the caller's job.
+static void setMax7219Brightness(uint8_t level) {
+  if (level > MAX7219_BRIGHTNESS_MAX) {
+    level = MAX7219_BRIGHTNESS_MAX;
+  }
+  max7219Brightness = level;
+  maxDisplay.setIntensity(max7219Brightness);
+}
+
 // Ticks Parola's animation every call (needed for smooth scrolling) and
 // pushes a fresh HH:MM from the RTC once a second.
 static void pollMax7219() {
@@ -597,17 +610,19 @@ static void pollMax7219() {
 // The ESP32 EEPROM library emulates a small EEPROM in a flash partition;
 // EEPROM.begin(EEPROM_SIZE) must run once in setup() before any access.
 // Layout: a magic byte to detect an uninitialized/foreign partition, the
-// UTC offset (int8_t hours), then the NTP server name as a fixed-length,
-// NUL-terminated byte array. loadConfig() seeds the defaults on first
-// boot; the WiFiManager save-params callback (see initWifi) calls
-// saveConfig() when the user edits either field in the portal.
+// UTC offset (int8_t hours), the NTP server name as a fixed-length,
+// NUL-terminated byte array, then the display brightness (uint8_t 0..15).
+// loadConfig() seeds the defaults on first boot; saveConfig() is called by
+// the WiFiManager save-params callback (see initWifi) and by the MCP
+// set_ntp_config / set_display_brightness tools.
 // ---------------------------------------------------------------------
 
-static const int     EEPROM_SIZE        = 128;
-static const int     EEPROM_MAGIC_ADDR  = 0;
-static const int     EEPROM_TZ_ADDR     = 1;   // int8_t, UTC offset in hours
-static const int     EEPROM_NTP_ADDR    = 2;   // char[NTP_SERVER_MAXLEN]
-static const uint8_t EEPROM_MAGIC       = 0x37;
+static const int     EEPROM_SIZE            = 128;
+static const int     EEPROM_MAGIC_ADDR      = 0;
+static const int     EEPROM_TZ_ADDR         = 1;   // int8_t, UTC offset in hours
+static const int     EEPROM_NTP_ADDR        = 2;   // char[NTP_SERVER_MAXLEN]
+static const int     EEPROM_BRIGHTNESS_ADDR = 66;  // uint8_t, 0..MAX7219_BRIGHTNESS_MAX
+static const uint8_t EEPROM_MAGIC           = 0x37;
 
 static const size_t  NTP_SERVER_MAXLEN  = 64;
 
@@ -618,8 +633,10 @@ static void saveConfig() {
   EEPROM.write(EEPROM_MAGIC_ADDR, EEPROM_MAGIC);
   EEPROM.write(EEPROM_TZ_ADDR, (uint8_t)utcOffsetHours);
   EEPROM.writeBytes(EEPROM_NTP_ADDR, ntpServer, NTP_SERVER_MAXLEN);
+  EEPROM.write(EEPROM_BRIGHTNESS_ADDR, max7219Brightness);
   EEPROM.commit();
-  log_printf("config saved: ntpServer=%s, utcOffset=%dh\n", ntpServer, utcOffsetHours);
+  log_printf("config saved: ntpServer=%s, utcOffset=%dh, brightness=%u\n",
+             ntpServer, utcOffsetHours, max7219Brightness);
 }
 
 static void loadConfig() {
@@ -635,7 +652,14 @@ static void loadConfig() {
   if (ntpServer[0] == '\0') {
     strncpy(ntpServer, "fi.pool.ntp.org", NTP_SERVER_MAXLEN - 1);
   }
-  log_printf("config loaded: ntpServer=%s, utcOffset=%dh\n", ntpServer, utcOffsetHours);
+
+  uint8_t brightness = EEPROM.read(EEPROM_BRIGHTNESS_ADDR);
+  // Falls here for EEPROM written before the brightness byte existed (0xFF).
+  max7219Brightness = (brightness <= MAX7219_BRIGHTNESS_MAX) ? brightness
+                                                            : MAX7219_BRIGHTNESS_DEFAULT;
+
+  log_printf("config loaded: ntpServer=%s, utcOffset=%dh, brightness=%u\n",
+             ntpServer, utcOffsetHours, max7219Brightness);
 }
 
 // ---------------------------------------------------------------------
@@ -832,9 +856,12 @@ static bool syncNtp() {
 // are plain application/json -- no SSE streaming.
 //
 // Tools:
-//   get_sensors      -- dump the whole `sensors` struct
-//   get_ds3231_time  -- read the DS3231 wall clock live
-//   set_ntp_config   -- change ntpServer / utcOffsetHours, persist, re-sync
+//   get_sensors             -- dump the whole `sensors` struct
+//   get_ds3231_time         -- read the DS3231 wall clock live
+//   get_ntp_config          -- current ntpServer / utcOffsetHours / last sync ok
+//   set_ntp_config          -- change ntpServer / utcOffsetHours, persist, re-sync
+//   get_display_brightness  -- current MAX7219 intensity (0..15)
+//   set_display_brightness  -- change MAX7219 intensity, persist
 // ---------------------------------------------------------------------
 
 static const uint16_t MCP_PORT = 8080;
@@ -933,6 +960,20 @@ static void mcpToolGetDs3231Time(JsonObject result, bool &isError) {
   mcpAddText(result, text);
 }
 
+static void mcpFillNtpConfig(JsonObject result) {
+  JsonObject sc = result["structuredContent"].to<JsonObject>();
+  sc["ntp_server"]       = String(ntpServer);
+  sc["utc_offset_hours"] = utcOffsetHours;
+  sc["last_sync_ok"]     = ntpLastOk;
+  String text;
+  serializeJson(sc, text);
+  mcpAddText(result, text);
+}
+
+static void mcpToolGetNtpConfig(JsonObject result) {
+  mcpFillNtpConfig(result);
+}
+
 static void mcpToolSetNtpConfig(JsonObjectConst args, JsonObject result, bool &isError) {
   bool changed = false;
 
@@ -973,12 +1014,39 @@ static void mcpToolSetNtpConfig(JsonObjectConst args, JsonObject result, bool &i
   saveConfig();
   ntpLastAttemptMs = 0;  // force a fresh NTP sync with the new settings
 
+  mcpFillNtpConfig(result);
+}
+
+static void mcpFillBrightness(JsonObject result) {
   JsonObject sc = result["structuredContent"].to<JsonObject>();
-  sc["ntp_server"]       = String(ntpServer);
-  sc["utc_offset_hours"] = utcOffsetHours;
+  sc["brightness"] = max7219Brightness;
+  sc["min"]        = 0;
+  sc["max"]        = MAX7219_BRIGHTNESS_MAX;
   String text;
   serializeJson(sc, text);
   mcpAddText(result, text);
+}
+
+static void mcpToolGetDisplayBrightness(JsonObject result) {
+  mcpFillBrightness(result);
+}
+
+static void mcpToolSetDisplayBrightness(JsonObjectConst args, JsonObject result, bool &isError) {
+  if (args["brightness"].isNull() || !args["brightness"].is<int>()) {
+    mcpAddText(result, "brightness (integer 0..15) is required");
+    isError = true;
+    return;
+  }
+  int level = args["brightness"].as<int>();
+  if (level < 0 || level > MAX7219_BRIGHTNESS_MAX) {
+    mcpAddText(result, "brightness must be between 0 and 15");
+    isError = true;
+    return;
+  }
+
+  setMax7219Brightness((uint8_t)level);
+  saveConfig();
+  mcpFillBrightness(result);
 }
 
 static void mcpFillToolsList(JsonObject result) {
@@ -1005,6 +1073,15 @@ static void mcpFillToolsList(JsonObject result) {
   }
   {
     JsonObject t = tools.add<JsonObject>();
+    t["name"] = "get_ntp_config";
+    t["description"] = "Read the configured NTP server hostname, the UTC offset (hours), "
+                       "and whether the last NTP sync succeeded.";
+    JsonObject schema = t["inputSchema"].to<JsonObject>();
+    schema["type"] = "object";
+    schema["properties"].to<JsonObject>();
+  }
+  {
+    JsonObject t = tools.add<JsonObject>();
     t["name"] = "set_ntp_config";
     t["description"] = "Update the NTP server hostname and/or the UTC offset (hours). "
                        "Changes are persisted to EEPROM and trigger an immediate re-sync.";
@@ -1019,6 +1096,30 @@ static void mcpFillToolsList(JsonObject result) {
     p2["minimum"] = -14;
     p2["maximum"] = 14;
     p2["description"] = "Hours to add to UTC before writing the RTC";
+  }
+  {
+    JsonObject t = tools.add<JsonObject>();
+    t["name"] = "get_display_brightness";
+    t["description"] = "Read the current MAX7219 LED matrix intensity (0..15).";
+    JsonObject schema = t["inputSchema"].to<JsonObject>();
+    schema["type"] = "object";
+    schema["properties"].to<JsonObject>();
+  }
+  {
+    JsonObject t = tools.add<JsonObject>();
+    t["name"] = "set_display_brightness";
+    t["description"] = "Set the MAX7219 LED matrix intensity (0 = dimmest, 15 = "
+                       "brightest). Persisted to EEPROM.";
+    JsonObject schema = t["inputSchema"].to<JsonObject>();
+    schema["type"] = "object";
+    JsonObject props = schema["properties"].to<JsonObject>();
+    JsonObject p = props["brightness"].to<JsonObject>();
+    p["type"] = "integer";
+    p["minimum"] = 0;
+    p["maximum"] = 15;
+    p["description"] = "MAX7219 intensity level";
+    JsonArray req = schema["required"].to<JsonArray>();
+    req.add("brightness");
   }
 }
 
@@ -1079,8 +1180,14 @@ static void handleMcpPost() {
       mcpToolGetSensors(result);
     } else if (strcmp(name, "get_ds3231_time") == 0) {
       mcpToolGetDs3231Time(result, isError);
+    } else if (strcmp(name, "get_ntp_config") == 0) {
+      mcpToolGetNtpConfig(result);
     } else if (strcmp(name, "set_ntp_config") == 0) {
       mcpToolSetNtpConfig(args, result, isError);
+    } else if (strcmp(name, "get_display_brightness") == 0) {
+      mcpToolGetDisplayBrightness(result);
+    } else if (strcmp(name, "set_display_brightness") == 0) {
+      mcpToolSetDisplayBrightness(args, result, isError);
     } else {
       mcpAddText(result, String("unknown tool: ") + name);
       isError = true;
