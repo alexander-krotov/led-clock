@@ -1,6 +1,6 @@
-# led-clock
+# LED Clock with MCP controls
 
-An ESP32-based LED matrix clock, built around a Ozobot RVDKit board, a DS3231 RTC, and a bank of
+An ESP32-based LED matrix clock, built around a ESP32C3 Super Mini module, a DS3231 RTC, and a bank of
 environmental sensors sitting on a shared I2C bus. Time is kept on the DS3231 and periodically
 disciplined against NTP over WiFi; the current time is shown on a 4x8x8 MAX7219 LED matrix display.
 The whole thing also exposes an MCP (Model Context Protocol) HTTP endpoint so an LLM agent can read
@@ -28,7 +28,7 @@ the sensors and RTC, and adjust the NTP config and display brightness, over the 
 
 ## Hardware
 
-- ESP32-C3 or ESP32-S3 board (tested on the Ozobot RVDKit / ESP32-C3 Super Mini)
+- ESP32-C3 or ESP32-S3 board (tested on ESP32-C3 Super Mini)
 - DS3231 RTC module
 - AHT20 temperature/humidity sensor
 - BMP280 or BME280 pressure sensor
@@ -58,6 +58,10 @@ The AS3935 and BMx280 I2C addresses depend on how each board straps its address 
 probes the common candidates at boot and, for the BMx280, reads back the chip ID to tell a BMP280
 apart from a BME280. See the comment block at the top of `led-clock.ino` for the full pin/address
 details, including the ESP32-S3 variant's pinout.
+
+## Schematics:
+
+Schematics and PCB: https://oshwlab.com/alexander.krotov/project_laloxymh
 
 ## Building / flashing
 
