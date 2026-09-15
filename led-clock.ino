@@ -429,17 +429,18 @@ static void readSgp30() {
 // Four 8x8 modules split into two MD_Parola zones, both fed from the
 // DS3231 RTC once a second:
 //   - left zone  (modules 2-3): text "HH:", right-aligned
-//   - right zone (modules 0-1): text ":MM", left-aligned
-// The two colons meet in the middle of the chain and read as the HH:MM
-// separator. A zone whose text changes scrolls the new text down while
+//   - right zone (modules 0-1): text "MM", left-aligned
+// The colon lives in the left (hours) zone, sitting at the middle of the
+// chain and reading as the HH:MM separator, so a minutes-only change never
+// touches it. A zone whose text changes scrolls the new text down while
 // the other zone stays static.
 // ---------------------------------------------------------------------
 
 #define MAX7219_HARDWARE_TYPE MD_MAX72XX::FC16_HW
 #define MAX7219_MAX_DEVICES   4  // total 8x8 modules in the chain
-#define MAX7219_NUM_ZONES     2  // left = "HH:", right = ":MM"
+#define MAX7219_NUM_ZONES     2  // left = "HH:", right = "MM"
 
-#define MAX7219_ZONE_RIGHT    0  // modules 0-1, ":MM", left-aligned
+#define MAX7219_ZONE_RIGHT    0  // modules 0-1, "MM", left-aligned
 #define MAX7219_ZONE_LEFT     1  // modules 2-3, "HH:", right-aligned
 
 static const uint8_t MAX7219_BRIGHTNESS_MAX     = 15;  // MAX7219 hardware intensity range is 0..15
@@ -449,13 +450,13 @@ static uint8_t max7219Brightness = MAX7219_BRIGHTNESS_DEFAULT;  // 0..15, loaded
 static const uint32_t MAX7219_SCROLL_SPEED = 40; // ms per scroll frame
 
 // MD_Parola only positions text at whole-module (8px) granularity, so the
-// left zone's "HH" ends up flush against the colon (the first glyph of the
-// right zone). After each static redraw of the left zone its two modules'
-// pixels are shifted this many columns to open a gap before the colon.
-static const uint8_t MAX7219_LEFT_NUDGE_COLS = 1;
-// Shift direction: TSL moves the digits away from the colon. If they move
-// the wrong way (into the right zone) on your module wiring, use TSR.
-static const MD_MAX72XX::transformType_t MAX7219_LEFT_NUDGE_XFORM = MD_MAX72XX::TSL;
+// right zone's "MM" ends up flush against the left zone's colon. After each
+// static redraw of the right zone its two modules' pixels are shifted this
+// many columns to open a gap between the colon and "MM".
+static const uint8_t MAX7219_RIGHT_NUDGE_COLS = 1;
+// Shift direction: TSR moves "MM" away from the colon. If it moves
+// the wrong way (into the left zone) on your module wiring, use TSL.
+static const MD_MAX72XX::transformType_t MAX7219_RIGHT_NUDGE_XFORM = MD_MAX72XX::TSR;
 
 MD_Parola maxDisplay(MAX7219_HARDWARE_TYPE, PIN_MAX7219_DATA, PIN_MAX7219_CLK,
                       PIN_MAX7219_CS, MAX7219_MAX_DEVICES);
@@ -469,10 +470,10 @@ struct Max7219ZoneState {
 
 Max7219ZoneState max7219Zones[MAX7219_NUM_ZONES];
 
-// Set when the left zone has just been drawn as static text and still needs
+// Set when the right zone has just been drawn as static text and still needs
 // its column nudge re-applied (each redraw starts from the module-aligned
 // position and overwrites the previous shift).
-static bool max7219LeftNudgePending = false;
+static bool max7219RightNudgePending = false;
 
 static void initMax7219Zones() {
   maxDisplay.setZone(MAX7219_ZONE_RIGHT, 0, 1);
@@ -496,16 +497,16 @@ static void initMax7219Zones() {
                                 MAX7219_SCROLL_SPEED, 0, PA_PRINT, PA_NO_EFFECT);
   }
 
-  max7219LeftNudgePending = true;
+  max7219RightNudgePending = true;
 }
 
-// Shift the left zone (modules 2-3) sideways by MAX7219_LEFT_NUDGE_COLS so
-// its "HH" is not flush against the colon. Must run after every static
-// redraw of that zone, since Parola redraws it module-aligned.
-static void applyMax7219LeftNudge() {
+// Shift the right zone (modules 0-1) sideways by MAX7219_RIGHT_NUDGE_COLS so
+// its "MM" is not flush against the colon. Must run after every static redraw
+// of that zone, since Parola redraws it module-aligned.
+static void applyMax7219RightNudge() {
   MD_MAX72XX *mx = maxDisplay.getGraphicObject();
-  for (uint8_t i = 0; i < MAX7219_LEFT_NUDGE_COLS; i++) {
-    mx->transform(2, 3, MAX7219_LEFT_NUDGE_XFORM);
+  for (uint8_t i = 0; i < MAX7219_RIGHT_NUDGE_COLS; i++) {
+    mx->transform(0, 1, MAX7219_RIGHT_NUDGE_XFORM);
   }
   mx->update();
 }
@@ -520,10 +521,12 @@ static void triggerMax7219ScrollDown(uint8_t z, const char *text) {
   max7219Zones[z].scrolling = true;
 }
 
-// Feed a fresh HH:MM to the two zones ("HH:" left, ":MM" right).
+// Feed a fresh HH:MM to the two zones ("HH:" left, "MM" right). Keeping the
+// colon in the left (hours) zone means a minutes-only update never touches
+// it, so it doesn't scroll every time the minutes change.
 static void updateMax7219Time(char hTens, char hUnits, char mTens, char mUnits) {
-  char leftText[8]  = {hTens, hUnits,  '\0'};
-  char rightText[8] = {':', mTens, mUnits, '\0'};
+  char leftText[8]  = {hTens, hUnits, ':', '\0'};
+  char rightText[8] = {mTens, mUnits, '\0'};
   const char *want[MAX7219_NUM_ZONES];
   want[MAX7219_ZONE_LEFT]  = leftText;
   want[MAX7219_ZONE_RIGHT] = rightText;
@@ -571,18 +574,18 @@ static void pollMax7219() {
       maxDisplay.displayZoneText(z, max7219Zones[z].current, max7219Zones[z].align,
                                   MAX7219_SCROLL_SPEED, 0, PA_PRINT, PA_NO_EFFECT);
       maxDisplay.displayReset(z);
-      if (z == MAX7219_ZONE_LEFT) {
-        max7219LeftNudgePending = true;
+      if (z == MAX7219_ZONE_RIGHT) {
+        max7219RightNudgePending = true;
       }
     }
   }
 
-  // Re-apply the left-zone column nudge once the zone is idle again.
-  if (max7219LeftNudgePending &&
-      !max7219Zones[MAX7219_ZONE_LEFT].scrolling &&
-      maxDisplay.getZoneStatus(MAX7219_ZONE_LEFT)) {
-    applyMax7219LeftNudge();
-    max7219LeftNudgePending = false;
+  // Re-apply the right-zone column nudge once the zone is idle again.
+  if (max7219RightNudgePending &&
+      !max7219Zones[MAX7219_ZONE_RIGHT].scrolling &&
+      maxDisplay.getZoneStatus(MAX7219_ZONE_RIGHT)) {
+    applyMax7219RightNudge();
+    max7219RightNudgePending = false;
   }
 
   if (!ds3231Present) {
@@ -730,7 +733,7 @@ static void pumpMax7219UntilIdle(uint8_t z, uint32_t timeoutMs) {
 }
 
 // Scroll the DHCP-assigned IP address once across the whole four-module
-// chain, then restore the two-zone HH / :MM clock layout. Called from
+// chain, then restore the two-zone HH: / MM clock layout. Called from
 // setup() after WiFi connects -- the display is too narrow to show an IP
 // address all at once.
 static void showIpOnMax7219() {
