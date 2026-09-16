@@ -449,6 +449,12 @@ static uint8_t max7219Brightness = MAX7219_BRIGHTNESS_DEFAULT;  // 0..15, loaded
 
 static const uint32_t MAX7219_SCROLL_SPEED = 40; // ms per scroll frame
 
+// Modules per zone (both zones span this many of the MAX7219_MAX_DEVICES
+// modules) and blank rows kept between the exiting and entering values while
+// a zone's text is scrolling -- see triggerMax7219Scroll()/stepMax7219Scroll().
+static const uint8_t MAX7219_ZONE_DEVICES = MAX7219_MAX_DEVICES / MAX7219_NUM_ZONES;
+static const uint8_t MAX7219_GAP_ROWS     = 1;
+
 // MD_Parola only positions text at whole-module (8px) granularity, so the
 // right zone's "MM" ends up flush against the left zone's colon. After each
 // static redraw of the right zone its two modules' pixels are shifted this
@@ -461,17 +467,33 @@ static const MD_MAX72XX::transformType_t MAX7219_RIGHT_NUDGE_XFORM = MD_MAX72XX:
 MD_Parola maxDisplay(MAX7219_HARDWARE_TYPE, PIN_MAX7219_DATA, PIN_MAX7219_CLK,
                       PIN_MAX7219_CS, MAX7219_MAX_DEVICES);
 
-// A zone's text change is played as two chained scroll-down animations: the
-// old text first scrolls down and off (EXITING), then the new text scrolls
-// down into place from the top (ENTERING) -- see triggerMax7219Exit()/
-// triggerMax7219Enter() and the phase transition in pollMax7219().
-enum Max7219ZonePhase : uint8_t { MAX7219_IDLE, MAX7219_EXITING, MAX7219_ENTERING };
-
+// A zone's text change is played as a single custom scroll-down animation
+// that shifts the whole zone (both old and new text) down one pixel row at a
+// time: the old text's rows exit at the bottom while the new text's rows
+// enter at the top, with MAX7219_GAP_ROWS blank rows between them so both
+// are visible at once mid-scroll rather than touching. This is done with
+// direct MD_MAX72XX row manipulation (see triggerMax7219Scroll()/
+// stepMax7219Scroll()) rather than Parola's own scroll effects, because a
+// single Parola zone can only animate one text at a time -- its entry/exit
+// effects both operate on whatever text is currently assigned to the zone,
+// so there's no way to have Parola scroll the old text and new text
+// together as one motion.
 struct Max7219ZoneState {
-  textPosition_t align;    // PA_LEFT / PA_RIGHT for this zone
-  char current[8];         // text currently on screen (Parola holds this pointer)
-  char next[8];            // text being scrolled in once the exit finishes
-  Max7219ZonePhase phase;  // MAX7219_IDLE while static, else which leg is playing
+  textPosition_t align;   // PA_LEFT / PA_RIGHT for this zone
+  uint8_t devStart;       // first MD_MAX72XX device index for this zone
+  uint8_t devEnd;         // last MD_MAX72XX device index for this zone (inclusive)
+  char current[8];        // text currently on screen (Parola holds this pointer)
+  char next[8];           // text being scrolled in
+  bool scrolling;         // true while the custom scroll animation is running
+  uint8_t step;           // rows fed in so far, 0..(ROW_SIZE + MAX7219_GAP_ROWS)
+  uint32_t lastStepMs;    // millis() timestamp of the last row-shift step
+  // Snapshots of the zone's pixels (per device-in-zone, per row) taken just
+  // before a scroll starts: what's currently on screen, and what `next`
+  // renders to. stepMax7219Scroll() feeds rows out of these into the live
+  // display as it shifts, without ever having "next" reach the physical
+  // display until the animation lands on it (see triggerMax7219Scroll()).
+  uint8_t oldRows[MAX7219_ZONE_DEVICES][ROW_SIZE];
+  uint8_t newRows[MAX7219_ZONE_DEVICES][ROW_SIZE];
 };
 
 Max7219ZoneState max7219Zones[MAX7219_NUM_ZONES];
@@ -485,8 +507,12 @@ static void initMax7219Zones() {
   maxDisplay.setZone(MAX7219_ZONE_RIGHT, 0, 1);
   maxDisplay.setZone(MAX7219_ZONE_LEFT, 2, 3);
 
-  max7219Zones[MAX7219_ZONE_RIGHT].align = PA_LEFT;
-  max7219Zones[MAX7219_ZONE_LEFT].align  = PA_RIGHT;
+  max7219Zones[MAX7219_ZONE_RIGHT].align    = PA_LEFT;
+  max7219Zones[MAX7219_ZONE_RIGHT].devStart = 0;
+  max7219Zones[MAX7219_ZONE_RIGHT].devEnd   = 1;
+  max7219Zones[MAX7219_ZONE_LEFT].align     = PA_RIGHT;
+  max7219Zones[MAX7219_ZONE_LEFT].devStart  = 2;
+  max7219Zones[MAX7219_ZONE_LEFT].devEnd    = 3;
 
   MD_MAX72XX::fontType_t *fontDef;
 
@@ -497,7 +523,9 @@ static void initMax7219Zones() {
 
     max7219Zones[z].current[0] = '\0';
     max7219Zones[z].next[0]    = '\0';
-    max7219Zones[z].phase      = MAX7219_IDLE;
+    max7219Zones[z].scrolling  = false;
+    max7219Zones[z].step       = 0;
+    max7219Zones[z].lastStepMs = 0;
 
     maxDisplay.displayZoneText(z, max7219Zones[z].current, max7219Zones[z].align,
                                 MAX7219_SCROLL_SPEED, 0, PA_PRINT, PA_NO_EFFECT);
@@ -517,28 +545,120 @@ static void applyMax7219RightNudge() {
   mx->update();
 }
 
-// Phase 1 of a text change: scroll the zone's current (old) text down and
-// off the display. Parola's entry/exit effects both animate whatever text is
-// currently assigned to the zone, so this call keeps `current` assigned and
-// only exercises its exit effect (PA_SCROLL_DOWN); the entry effect
-// (PA_PRINT) just redraws it in place first, which is a no-op since it's
-// already showing. Once the zone reaches END, pollMax7219() starts phase 2.
-static void triggerMax7219Exit(uint8_t z) {
-  maxDisplay.displayZoneText(z, max7219Zones[z].current, max7219Zones[z].align,
-                              MAX7219_SCROLL_SPEED, 0, PA_PRINT, PA_SCROLL_DOWN);
-  maxDisplay.displayReset(z);
-  max7219Zones[z].phase = MAX7219_EXITING;
+// Copy the zone's live pixels into `rows` (indexed by device-within-zone,
+// then row), or the reverse -- write `rows` into the zone's live pixels.
+static void captureMax7219ZoneRows(uint8_t z, uint8_t rows[MAX7219_ZONE_DEVICES][ROW_SIZE]) {
+  MD_MAX72XX *mx = maxDisplay.getGraphicObject();
+  for (uint8_t d = max7219Zones[z].devStart; d <= max7219Zones[z].devEnd; d++) {
+    for (uint8_t r = 0; r < ROW_SIZE; r++) {
+      rows[d - max7219Zones[z].devStart][r] = mx->getRow(d, r);
+    }
+  }
 }
 
-// Phase 2 of a text change: scroll max7219Zones[z].next down into place from
-// the top (PA_SCROLL_DOWN entry effect). The exit effect is left at
-// PA_NO_EFFECT so the zone just holds once the new text arrives, instead of
-// immediately scrolling itself off again.
-static void triggerMax7219Enter(uint8_t z) {
-  maxDisplay.displayZoneText(z, max7219Zones[z].next, max7219Zones[z].align,
-                              MAX7219_SCROLL_SPEED, 0, PA_SCROLL_DOWN, PA_NO_EFFECT);
+static void restoreMax7219ZoneRows(uint8_t z, const uint8_t rows[MAX7219_ZONE_DEVICES][ROW_SIZE]) {
+  MD_MAX72XX *mx = maxDisplay.getGraphicObject();
+  for (uint8_t d = max7219Zones[z].devStart; d <= max7219Zones[z].devEnd; d++) {
+    for (uint8_t r = 0; r < ROW_SIZE; r++) {
+      mx->setRow(d, r, rows[d - max7219Zones[z].devStart][r]);
+    }
+  }
+}
+
+// Start a zone's scroll transition to max7219Zones[z].next: snapshot what's
+// currently on screen (oldRows), then render `next` through Parola just long
+// enough to snapshot it too (newRows), then put the old pixels straight back
+// so the physical display still shows the old text once this returns.
+// `mx->update(OFF)` suspends hardware flushes while doing this, but Parola's
+// own displayAnimate() (needed to actually run the PA_PRINT render) turns
+// updates back on and flushes internally as part of finishing -- so updates
+// are re-suspended immediately after it returns, before the old pixels are
+// restored, to keep that restore from being flushed to hardware one row at a
+// time. `next` still reaches the physical display for one atomic flush (from
+// that internal re-enable, and from applyMax7219RightNudge()'s own forced
+// flush) before it's overwritten with the restored old pixels, but with no
+// delay between those flushes it's not visible. stepMax7219Scroll() (called
+// from pollMax7219()) then feeds oldRows/newRows into the display a row at a
+// time.
+static void triggerMax7219Scroll(uint8_t z) {
+  Max7219ZoneState &zs = max7219Zones[z];
+  MD_MAX72XX *mx = maxDisplay.getGraphicObject();
+
+  captureMax7219ZoneRows(z, zs.oldRows);
+
+  mx->update(MD_MAX72XX::OFF);
+  maxDisplay.displayZoneText(z, zs.next, zs.align, MAX7219_SCROLL_SPEED, 0, PA_PRINT, PA_NO_EFFECT);
   maxDisplay.displayReset(z);
-  max7219Zones[z].phase = MAX7219_ENTERING;
+  maxDisplay.displayAnimate();  // PA_PRINT's entry effect completes in one call
+  mx->update(MD_MAX72XX::OFF);  // displayAnimate() re-enabled updates -- suspend them again
+  if (z == MAX7219_ZONE_RIGHT) {
+    applyMax7219RightNudge();  // so newRows already has the right spacing
+  }
+  captureMax7219ZoneRows(z, zs.newRows);
+  restoreMax7219ZoneRows(z, zs.oldRows);
+  mx->update(MD_MAX72XX::ON);
+
+  zs.step       = 0;
+  zs.scrolling  = true;
+  zs.lastStepMs = millis();
+}
+
+// Advance a zone's scroll by one row: shift every row in the zone's devices
+// down by one, then feed a row into the vacated top row. Over the full
+// MAX7219_GAP_ROWS + ROW_SIZE steps, the fed sequence is: the gap's blank
+// row(s) first, then newRows bottom-row-first up to newRows[0] last -- which
+// works out, once every row has shifted down the right number of times, to
+// exactly newRows sitting correctly oriented in the display when the last
+// step lands. (Feeding a row at the top and shifting down is like a strip
+// of [newRows (top) / blank gap / oldRows (bottom)] sliding down past the
+// display's 8-row window: the window starts over oldRows and ends over
+// newRows, and what enters the window's top edge at each step is simply the
+// next-higher row on that strip.)
+static void stepMax7219Scroll(uint8_t z) {
+  Max7219ZoneState &zs = max7219Zones[z];
+  MD_MAX72XX *mx = maxDisplay.getGraphicObject();
+  const uint8_t totalSteps = ROW_SIZE + MAX7219_GAP_ROWS;
+
+  int16_t stripIdx = (int16_t)(ROW_SIZE + MAX7219_GAP_ROWS) - (int16_t)(zs.step + 1);
+
+  mx->update(MD_MAX72XX::OFF);
+  for (uint8_t d = zs.devStart; d <= zs.devEnd; d++) {
+    uint8_t feed = (stripIdx >= ROW_SIZE) ? 0x00 : zs.newRows[d - zs.devStart][stripIdx];
+    for (uint8_t r = ROW_SIZE - 1; r > 0; r--) {
+      mx->setRow(d, r, mx->getRow(d, r - 1));
+    }
+    mx->setRow(d, 0, feed);
+  }
+  mx->update(MD_MAX72XX::ON);
+
+  zs.step++;
+  zs.lastStepMs = millis();
+
+  if (zs.step >= totalSteps) {
+    // The new text is now fully in place (nudge included, since newRows was
+    // captured after applying it) -- just latch it. No further redraw is
+    // needed: unlike Parola's own PA_PRINT, this animation never re-aligns
+    // the zone to whole-module boundaries, so there's nothing to re-nudge.
+    strcpy(zs.current, zs.next);
+    zs.scrolling = false;
+  }
+}
+
+// Show `text` in zone z immediately, with no scroll animation. Used only for
+// a zone's very first render (max7219Zones[z].current still the "never shown
+// anything yet" empty string set by initMax7219Zones()) -- there's no
+// meaningful old value to transition away from at boot or right after
+// showIpOnMax7219(), so the clock should just show the correct time straight
+// away instead of rolling it in from blank.
+static void showMax7219ZoneImmediate(uint8_t z, const char *text) {
+  strncpy(max7219Zones[z].current, text, sizeof(max7219Zones[z].current) - 1);
+  max7219Zones[z].current[sizeof(max7219Zones[z].current) - 1] = '\0';
+  maxDisplay.displayZoneText(z, max7219Zones[z].current, max7219Zones[z].align,
+                              MAX7219_SCROLL_SPEED, 0, PA_PRINT, PA_NO_EFFECT);
+  maxDisplay.displayReset(z);
+  if (z == MAX7219_ZONE_RIGHT) {
+    max7219RightNudgePending = true;
+  }
 }
 
 // Feed a fresh HH:MM to the two zones ("HH:" left, "MM" right). Keeping the
@@ -556,13 +676,17 @@ static void updateMax7219Time(char hTens, char hUnits, char mTens, char mUnits) 
 #endif
 
   for (uint8_t z = 0; z < MAX7219_NUM_ZONES; z++) {
-    if (max7219Zones[z].phase != MAX7219_IDLE) {
-      continue; // wait for the running transition to finish
+    if (max7219Zones[z].scrolling) {
+      continue; // wait for the running scroll to finish
     }
     if (strcmp(want[z], max7219Zones[z].current) != 0) {
-      strncpy(max7219Zones[z].next, want[z], sizeof(max7219Zones[z].next) - 1);
-      max7219Zones[z].next[sizeof(max7219Zones[z].next) - 1] = '\0';
-      triggerMax7219Exit(z);
+      if (max7219Zones[z].current[0] == '\0') {
+        showMax7219ZoneImmediate(z, want[z]);
+      } else {
+        strncpy(max7219Zones[z].next, want[z], sizeof(max7219Zones[z].next) - 1);
+        max7219Zones[z].next[sizeof(max7219Zones[z].next) - 1] = '\0';
+        triggerMax7219Scroll(z);
+      }
     }
   }
 }
@@ -582,42 +706,31 @@ static void setMax7219Brightness(uint8_t level) {
   maxDisplay.setIntensity(max7219Brightness);
 }
 
-// Ticks Parola's animation every call (needed for smooth scrolling) and
-// pushes a fresh HH:MM from the RTC once a second.
+// Advances any in-progress zone scroll (see stepMax7219Scroll(), on its own
+// MAX7219_SCROLL_SPEED timer per zone) and pushes a fresh HH:MM from the RTC
+// once a second. Also ticks Parola's own animation: nothing here relies on it
+// any more for the HH:MM scroll itself (that's all done by stepMax7219Scroll()
+// via direct MD_MAX72XX row access), but it's what lets the zones' FSMs
+// settle to "idle" after the PA_PRINT render triggerMax7219Scroll() uses to
+// capture a zone's new pixels, and after initMax7219Zones()'s startup redraw
+// -- which the right-zone nudge reapply below waits on. It's a cheap no-op
+// once a zone's FSM is idle.
 static void pollMax7219() {
-  if (maxDisplay.displayAnimate()) {
-    for (uint8_t z = 0; z < MAX7219_NUM_ZONES; z++) {
-      if (!maxDisplay.getZoneStatus(z)) {
-        continue;
-      }
-      switch (max7219Zones[z].phase) {
-        case MAX7219_EXITING:
-          // Old text has scrolled off the bottom -- bring the new text in
-          // from the top.
-          triggerMax7219Enter(z);
-          break;
+  uint32_t now = millis();
+  maxDisplay.displayAnimate();
 
-        case MAX7219_ENTERING:
-          // New text has arrived -- latch it and hold it static.
-          strcpy(max7219Zones[z].current, max7219Zones[z].next);
-          max7219Zones[z].phase = MAX7219_IDLE;
-          maxDisplay.displayZoneText(z, max7219Zones[z].current, max7219Zones[z].align,
-                                      MAX7219_SCROLL_SPEED, 0, PA_PRINT, PA_NO_EFFECT);
-          maxDisplay.displayReset(z);
-          if (z == MAX7219_ZONE_RIGHT) {
-            max7219RightNudgePending = true;
-          }
-          break;
-
-        case MAX7219_IDLE:
-          break;
-      }
+  for (uint8_t z = 0; z < MAX7219_NUM_ZONES; z++) {
+    if (max7219Zones[z].scrolling && now - max7219Zones[z].lastStepMs >= MAX7219_SCROLL_SPEED) {
+      stepMax7219Scroll(z);
     }
   }
 
-  // Re-apply the right-zone column nudge once the zone is idle again.
+  // Re-apply the right-zone column nudge once the zone is idle again (only
+  // needed after initMax7219Zones()'s own PA_PRINT redraw at startup / after
+  // showIpOnMax7219() -- triggerMax7219Scroll() bakes the nudge into its own
+  // animation directly, so normal HH:MM transitions don't need this).
   if (max7219RightNudgePending &&
-      max7219Zones[MAX7219_ZONE_RIGHT].phase == MAX7219_IDLE &&
+      !max7219Zones[MAX7219_ZONE_RIGHT].scrolling &&
       maxDisplay.getZoneStatus(MAX7219_ZONE_RIGHT)) {
     applyMax7219RightNudge();
     max7219RightNudgePending = false;
@@ -629,7 +742,6 @@ static void pollMax7219() {
   }
 
   static uint32_t lastMax7219SecMs = 0;
-  uint32_t now = millis();
   if (now - lastMax7219SecMs > 1000UL) {
     lastMax7219SecMs = now;
 

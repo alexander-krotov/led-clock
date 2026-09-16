@@ -139,25 +139,42 @@ The file is organized into clearly delimited sections (see the `// ----` banners
   modules 0-1) shows `"MM"` left-aligned, so the colon (the left zone's trailing glyph) sits at the middle of the
   chain and reads as the HH:MM separator (no hand-drawn colon any more). Keeping the colon in the hours zone means a
   minutes-only update never scrolls it. Both zones are fed from the DS3231 RTC (`rtc.getHour()`/`getMinute()`) once a
-  second; a zone whose text changed plays two chained scroll-down animations rather than one, tracked via a
-  `Max7219ZoneState.phase` (`MAX7219_IDLE`/`MAX7219_EXITING`/`MAX7219_ENTERING`): `triggerMax7219Exit()` first scrolls
-  the zone's *old* text down and off (`PA_SCROLL_DOWN` as the exit effect on the unchanged `current` text, `PA_PRINT`
-  as a no-op entry effect since it's already on screen), then, once `pollMax7219()` sees that zone reach
-  `getZoneStatus()==true`, `triggerMax7219Enter()` scrolls the *new* text (`next`) down into place from the top
-  (`PA_SCROLL_DOWN` as the entry effect, `PA_NO_EFFECT` as the exit effect so it just holds once arrived instead of
-  immediately scrolling off again). This two-phase split is needed because a single Parola `displayZoneText()` call's
-  entry/exit effects both animate whatever text is currently assigned to the zone -- there's no built-in way to
-  animate the old text out and a different new text in with one call. The other zone stays static
-  (`PA_PRINT`/`PA_NO_EFFECT`) throughout. Per-zone alignment is stored in `Max7219ZoneState.align` and reused for the
-  static redraw. Parola keeps a pointer to (not a copy of) the text it is shown, so each zone's `current`/`next` char
-  buffers live in the file-scope `max7219Zones[]` array rather than on the stack. Because MD_Parola only positions
-  text at whole-module (8px) granularity, the colon would otherwise be flush against `"MM"`;
-  `applyMax7219RightNudge()` shifts the right zone's two modules `MAX7219_RIGHT_NUDGE_COLS` (1) column(s) sideways
-  with `MD_MAX72xx::transform()` (direction `MAX7219_RIGHT_NUDGE_XFORM`, `TSL`/`TSR` depending on module wiring) to
-  open a small gap between the colon and `"MM"`. The shift has to be redone after every static redraw of the
-  zone, so `max7219RightNudgePending` is set on each redraw and `pollMax7219()` re-applies the nudge once the zone is
-  idle again. Unlike the other sections there's no presence flag — the display isn't probed, and `pollMax7219()` only
-  skips the RTC read (not the animation tick, needed for smooth scrolling) when `ds3231Present` is false. This section was
+  second; a zone's very first render (`Max7219ZoneState.current` still the empty string `initMax7219Zones()` sets it
+  to -- true at boot, and again right after `showIpOnMax7219()` calls `initMax7219Zones()`) is shown immediately via
+  `showMax7219ZoneImmediate()` (a plain `PA_PRINT`/`PA_NO_EFFECT` static redraw), since there's no meaningful old
+  value to animate away from; every render after that plays a custom scroll-down animation, driven by direct `MD_MAX72XX` row
+  manipulation rather than a Parola scroll effect, because a single Parola zone can only animate one text at a time
+  (its entry/exit effects both operate on whatever text is currently assigned to the zone) and this project wants the
+  outgoing and incoming values visible together, `MAX7219_GAP_ROWS` (1) blank row apart, as the whole zone shifts:
+  `triggerMax7219Scroll()` snapshots the zone's current on-screen pixels into `Max7219ZoneState.oldRows`, then
+  briefly renders `next` through Parola (`PA_PRINT`) to snapshot those pixels into `newRows` before restoring
+  `oldRows` to the live buffer -- done with the `MD_MAX72XX` `UPDATE` control switched off across the whole
+  render/snapshot/restore sequence so the restore doesn't get flushed to the physical LEDs row by row; the render
+  still reaches the LEDs for one atomic flush (Parola's own `displayAnimate()`, which this needs to actually run the
+  `PA_PRINT` effect, re-enables `UPDATE` internally as it finishes, so `UPDATE` is switched off again right
+  afterwards), but with no delay before it's overwritten by the restore this isn't visible. `pollMax7219()` then
+  calls `stepMax7219Scroll()` on a per-zone `MAX7219_SCROLL_SPEED` timer: each step shifts every row of the zone's
+  modules down by one (`MD_MAX72XX::getRow`/`setRow`) and feeds a new row into the vacated top row, sourced from a
+  virtual `[newRows (top) / blank gap / oldRows (bottom)]` strip sliding down past the display's 8-row window one
+  row at a time, so the old text's rows exit the bottom while the new text's rows enter the top with the gap passing
+  through in between. Once `ROW_SIZE + MAX7219_GAP_ROWS` steps land the new text exactly in place, `current` is
+  latched to `next` and the zone is marked idle again -- no further redraw needed, since the animation already left
+  those exact pixels on the display. The other zone stays static (`PA_PRINT`/`PA_NO_EFFECT`) throughout. Per-zone
+  alignment is stored in `Max7219ZoneState.align`; `devStart`/`devEnd` cache each zone's `MD_MAX72XX` device range
+  (matching the `setZone()` calls in `initMax7219Zones()`) for the row-level access. Parola keeps a pointer to (not
+  a copy of) the text it is shown, so each zone's `current`/`next` char buffers live in the file-scope
+  `max7219Zones[]` array rather than on the stack. Because MD_Parola only positions text at whole-module (8px)
+  granularity, the colon would otherwise be flush against `"MM"`; `applyMax7219RightNudge()` shifts the right zone's
+  two modules `MAX7219_RIGHT_NUDGE_COLS` (1) column(s) sideways with `MD_MAX72xx::transform()` (direction
+  `MAX7219_RIGHT_NUDGE_XFORM`, `TSL`/`TSR` depending on module wiring) to open a small gap between the colon and
+  `"MM"`. `triggerMax7219Scroll()` applies it before snapshotting `newRows`, so a normal HH:MM transition bakes the
+  nudge into the animation itself and needs no further correction. The only place still needing a follow-up nudge is
+  a genuine Parola static redraw -- `initMax7219Zones()`'s startup redraw (also used after `showIpOnMax7219()`),
+  which is module-aligned and sets `max7219RightNudgePending` so `pollMax7219()` re-applies the nudge once that
+  redraw's zone settles idle (`maxDisplay.getZoneStatus()`, driven by the `maxDisplay.displayAnimate()` tick
+  `pollMax7219()` still runs every call for exactly this reason -- the HH:MM scroll itself no longer needs it).
+  Unlike the other sections there's no presence flag — the display isn't probed, and `pollMax7219()` only skips the
+  RTC read (not the Parola/scroll-step ticks) when `ds3231Present` is false. This section was
   adapted from a standalone example sketch that also had NTP time sync, temperature display, and a physical
   brightness button on GPIO5; all three were dropped when merging — temperature because this project has its own
   sensors, the button because GPIO5 is `PIN_IRQ` on the ESP32-C3 variant and must stay reserved for the AS3935
