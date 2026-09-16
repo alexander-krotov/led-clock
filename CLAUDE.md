@@ -139,9 +139,17 @@ The file is organized into clearly delimited sections (see the `// ----` banners
   modules 0-1) shows `"MM"` left-aligned, so the colon (the left zone's trailing glyph) sits at the middle of the
   chain and reads as the HH:MM separator (no hand-drawn colon any more). Keeping the colon in the hours zone means a
   minutes-only update never scrolls it. Both zones are fed from the DS3231 RTC (`rtc.getHour()`/`getMinute()`) once a
-  second; a zone whose text changed scrolls the new text down (`PA_SCROLL_DOWN`) while the other stays static
-  (`PA_PRINT`/`PA_NO_EFFECT`). Per-zone alignment is stored in `Max7219ZoneState.align` and reused for the static
-  redraw. Parola keeps a pointer to (not a copy of) the text it is shown, so each zone's `current`/`next` char
+  second; a zone whose text changed plays two chained scroll-down animations rather than one, tracked via a
+  `Max7219ZoneState.phase` (`MAX7219_IDLE`/`MAX7219_EXITING`/`MAX7219_ENTERING`): `triggerMax7219Exit()` first scrolls
+  the zone's *old* text down and off (`PA_SCROLL_DOWN` as the exit effect on the unchanged `current` text, `PA_PRINT`
+  as a no-op entry effect since it's already on screen), then, once `pollMax7219()` sees that zone reach
+  `getZoneStatus()==true`, `triggerMax7219Enter()` scrolls the *new* text (`next`) down into place from the top
+  (`PA_SCROLL_DOWN` as the entry effect, `PA_NO_EFFECT` as the exit effect so it just holds once arrived instead of
+  immediately scrolling off again). This two-phase split is needed because a single Parola `displayZoneText()` call's
+  entry/exit effects both animate whatever text is currently assigned to the zone -- there's no built-in way to
+  animate the old text out and a different new text in with one call. The other zone stays static
+  (`PA_PRINT`/`PA_NO_EFFECT`) throughout. Per-zone alignment is stored in `Max7219ZoneState.align` and reused for the
+  static redraw. Parola keeps a pointer to (not a copy of) the text it is shown, so each zone's `current`/`next` char
   buffers live in the file-scope `max7219Zones[]` array rather than on the stack. Because MD_Parola only positions
   text at whole-module (8px) granularity, the colon would otherwise be flush against `"MM"`;
   `applyMax7219RightNudge()` shifts the right zone's two modules `MAX7219_RIGHT_NUDGE_COLS` (1) column(s) sideways

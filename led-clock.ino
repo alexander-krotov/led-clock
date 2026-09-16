@@ -461,11 +461,17 @@ static const MD_MAX72XX::transformType_t MAX7219_RIGHT_NUDGE_XFORM = MD_MAX72XX:
 MD_Parola maxDisplay(MAX7219_HARDWARE_TYPE, PIN_MAX7219_DATA, PIN_MAX7219_CLK,
                       PIN_MAX7219_CS, MAX7219_MAX_DEVICES);
 
+// A zone's text change is played as two chained scroll-down animations: the
+// old text first scrolls down and off (EXITING), then the new text scrolls
+// down into place from the top (ENTERING) -- see triggerMax7219Exit()/
+// triggerMax7219Enter() and the phase transition in pollMax7219().
+enum Max7219ZonePhase : uint8_t { MAX7219_IDLE, MAX7219_EXITING, MAX7219_ENTERING };
+
 struct Max7219ZoneState {
-  textPosition_t align;  // PA_LEFT / PA_RIGHT for this zone
-  char current[8];       // text currently on screen (Parola holds this pointer)
-  char next[8];          // text being scrolled in
-  bool scrolling;        // true while a scroll animation is running
+  textPosition_t align;    // PA_LEFT / PA_RIGHT for this zone
+  char current[8];         // text currently on screen (Parola holds this pointer)
+  char next[8];            // text being scrolled in once the exit finishes
+  Max7219ZonePhase phase;  // MAX7219_IDLE while static, else which leg is playing
 };
 
 Max7219ZoneState max7219Zones[MAX7219_NUM_ZONES];
@@ -491,7 +497,7 @@ static void initMax7219Zones() {
 
     max7219Zones[z].current[0] = '\0';
     max7219Zones[z].next[0]    = '\0';
-    max7219Zones[z].scrolling  = false;
+    max7219Zones[z].phase      = MAX7219_IDLE;
 
     maxDisplay.displayZoneText(z, max7219Zones[z].current, max7219Zones[z].align,
                                 MAX7219_SCROLL_SPEED, 0, PA_PRINT, PA_NO_EFFECT);
@@ -511,14 +517,28 @@ static void applyMax7219RightNudge() {
   mx->update();
 }
 
-static void triggerMax7219ScrollDown(uint8_t z, const char *text) {
-  strncpy(max7219Zones[z].next, text, sizeof(max7219Zones[z].next) - 1);
-  max7219Zones[z].next[sizeof(max7219Zones[z].next) - 1] = '\0';
-  // PA_SCROLL_DOWN scrolls content downward (new text enters from the top).
-  maxDisplay.displayZoneText(z, max7219Zones[z].next, max7219Zones[z].align,
-                              MAX7219_SCROLL_SPEED, 0, PA_SCROLL_DOWN, PA_SCROLL_DOWN);
+// Phase 1 of a text change: scroll the zone's current (old) text down and
+// off the display. Parola's entry/exit effects both animate whatever text is
+// currently assigned to the zone, so this call keeps `current` assigned and
+// only exercises its exit effect (PA_SCROLL_DOWN); the entry effect
+// (PA_PRINT) just redraws it in place first, which is a no-op since it's
+// already showing. Once the zone reaches END, pollMax7219() starts phase 2.
+static void triggerMax7219Exit(uint8_t z) {
+  maxDisplay.displayZoneText(z, max7219Zones[z].current, max7219Zones[z].align,
+                              MAX7219_SCROLL_SPEED, 0, PA_PRINT, PA_SCROLL_DOWN);
   maxDisplay.displayReset(z);
-  max7219Zones[z].scrolling = true;
+  max7219Zones[z].phase = MAX7219_EXITING;
+}
+
+// Phase 2 of a text change: scroll max7219Zones[z].next down into place from
+// the top (PA_SCROLL_DOWN entry effect). The exit effect is left at
+// PA_NO_EFFECT so the zone just holds once the new text arrives, instead of
+// immediately scrolling itself off again.
+static void triggerMax7219Enter(uint8_t z) {
+  maxDisplay.displayZoneText(z, max7219Zones[z].next, max7219Zones[z].align,
+                              MAX7219_SCROLL_SPEED, 0, PA_SCROLL_DOWN, PA_NO_EFFECT);
+  maxDisplay.displayReset(z);
+  max7219Zones[z].phase = MAX7219_ENTERING;
 }
 
 // Feed a fresh HH:MM to the two zones ("HH:" left, "MM" right). Keeping the
@@ -536,11 +556,13 @@ static void updateMax7219Time(char hTens, char hUnits, char mTens, char mUnits) 
 #endif
 
   for (uint8_t z = 0; z < MAX7219_NUM_ZONES; z++) {
-    if (max7219Zones[z].scrolling) {
-      continue; // wait for the running scroll to finish
+    if (max7219Zones[z].phase != MAX7219_IDLE) {
+      continue; // wait for the running transition to finish
     }
     if (strcmp(want[z], max7219Zones[z].current) != 0) {
-      triggerMax7219ScrollDown(z, want[z]);
+      strncpy(max7219Zones[z].next, want[z], sizeof(max7219Zones[z].next) - 1);
+      max7219Zones[z].next[sizeof(max7219Zones[z].next) - 1] = '\0';
+      triggerMax7219Exit(z);
     }
   }
 }
@@ -565,24 +587,37 @@ static void setMax7219Brightness(uint8_t level) {
 static void pollMax7219() {
   if (maxDisplay.displayAnimate()) {
     for (uint8_t z = 0; z < MAX7219_NUM_ZONES; z++) {
-      if (!maxDisplay.getZoneStatus(z) || !max7219Zones[z].scrolling) {
+      if (!maxDisplay.getZoneStatus(z)) {
         continue;
       }
-      // Scroll finished -- latch the new text and hold it static.
-      strcpy(max7219Zones[z].current, max7219Zones[z].next);
-      max7219Zones[z].scrolling = false;
-      maxDisplay.displayZoneText(z, max7219Zones[z].current, max7219Zones[z].align,
-                                  MAX7219_SCROLL_SPEED, 0, PA_PRINT, PA_NO_EFFECT);
-      maxDisplay.displayReset(z);
-      if (z == MAX7219_ZONE_RIGHT) {
-        max7219RightNudgePending = true;
+      switch (max7219Zones[z].phase) {
+        case MAX7219_EXITING:
+          // Old text has scrolled off the bottom -- bring the new text in
+          // from the top.
+          triggerMax7219Enter(z);
+          break;
+
+        case MAX7219_ENTERING:
+          // New text has arrived -- latch it and hold it static.
+          strcpy(max7219Zones[z].current, max7219Zones[z].next);
+          max7219Zones[z].phase = MAX7219_IDLE;
+          maxDisplay.displayZoneText(z, max7219Zones[z].current, max7219Zones[z].align,
+                                      MAX7219_SCROLL_SPEED, 0, PA_PRINT, PA_NO_EFFECT);
+          maxDisplay.displayReset(z);
+          if (z == MAX7219_ZONE_RIGHT) {
+            max7219RightNudgePending = true;
+          }
+          break;
+
+        case MAX7219_IDLE:
+          break;
       }
     }
   }
 
   // Re-apply the right-zone column nudge once the zone is idle again.
   if (max7219RightNudgePending &&
-      !max7219Zones[MAX7219_ZONE_RIGHT].scrolling &&
+      max7219Zones[MAX7219_ZONE_RIGHT].phase == MAX7219_IDLE &&
       maxDisplay.getZoneStatus(MAX7219_ZONE_RIGHT)) {
     applyMax7219RightNudge();
     max7219RightNudgePending = false;
