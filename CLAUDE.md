@@ -5,12 +5,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Overview
 
 This is a single-sketch Arduino project (`led-clock.ino`) targeting an ESP32-based board (Ozobot RVDKit). It
-implements I2C sensor discovery/polling, an RTC (DS3231) used as the time source, drives a MAX7219 LED matrix
-display (via SPI, independent of the I2C sensor bus) that shows the current time as read from the DS3231, connects to
-WiFi at boot via WiFiManager (captive-portal provisioning, credentials stored in NVS), keeps the DS3231 disciplined
-to an NTP server (name + UTC offset configurable in the portal, persisted in EEPROM), and exposes an unauthenticated
-MCP (Model Context Protocol) HTTP endpoint for reading the sensors / RTC / config and changing the NTP config and
-display brightness.
+implements I2C sensor discovery/polling, an RTC (DS3231) used as the time source, a NEO-6M GPS module on its own
+UART providing position/altitude/UTC time, drives a MAX7219 LED matrix display (via SPI, independent of the I2C
+sensor bus) that shows the current time as read from the DS3231, connects to WiFi at boot via WiFiManager
+(captive-portal provisioning, credentials stored in NVS), keeps the DS3231 disciplined to an NTP server (name + UTC
+offset configurable in the portal, persisted in EEPROM), and exposes an unauthenticated MCP (Model Context Protocol)
+HTTP endpoint for reading the sensors / RTC / config and changing the NTP config and display brightness.
 
 ## Build / upload
 
@@ -89,6 +89,13 @@ All five sensors are driven through third-party Arduino libraries rather than ha
   of board target). Not gated behind a presence probe like the I2C sensors — it's on its own SPI-style bus, not the
   shared `Wire` bus.
 
+- **TinyGPS++** (Mikal Hart, `TinyGPS++.h`) — `TinyGPSPlus gps;` fed byte-by-byte from a dedicated `HardwareSerial
+  gpsSerial(1)` (`PIN_GPS_RX`/`PIN_GPS_TX`, 9600 baud, fixed regardless of board target) parses NMEA sentences
+  internally; `gps.encode(c)` returns true once a full sentence has been parsed, at which point `gps.location`/
+  `gps.altitude`/`gps.date`/`gps.time`/`gps.satellites` (each with its own `isValid()`) hold the latest values.
+  Not gated behind a presence probe like the I2C sensors — there's no synchronous way to ACK/NAK a UART device, so
+  `sensors.gps.valid` (see Global sensor readings below) only becomes true once a full fix has actually been decoded.
+
 - **WiFiManager** (tzapu, `WiFiManager.h`, pulls in the ESP32 core `WiFi.h` and — because `WM_MDNS` is `#define`d
   before the include — `ESPmDNS.h`) — `initWifi()` sets STA mode, then `wm.setHostname("led-clock")` and
   `wm.autoConnect("led-clock")` with a 60s `setConfigPortalTimeout`; on failure to join a known network it serves a
@@ -133,6 +140,17 @@ The file is organized into clearly delimited sections (see the `// ----` banners
   logging stale values. Polled on its own `SGP30_MEASURE_INTERVAL_MS` (1000ms) timer, separate from
   `SENSOR_POLL_INTERVAL_MS`, because Sensirion's datasheet requires calling `measure_air_quality` once per second for
   the sensor's dynamic baseline compensation to stay accurate.
+- **NEO-6M GPS module** — `initGps()`/`readGps()`, using TinyGPS++ (see Sensor libraries above) over a dedicated
+  `HardwareSerial` (`PIN_GPS_RX`/`PIN_GPS_TX`, 9600 baud), not the shared I2C bus. Unlike the I2C sensors,
+  `readGps()` is called unconditionally from every `loop()` iteration rather than on a `SENSOR_POLL_INTERVAL_MS`
+  timer, since it just drains whatever bytes are currently sitting in the UART's ring buffer
+  (`gpsSerial.available()`/`.read()`) into `gps.encode()` -- polling it too infrequently risks the buffer filling up
+  and bytes being dropped mid-sentence. Each time `encode()` reports a complete NMEA sentence, `readGps()` checks
+  `gps.location`/`gps.altitude`/`gps.date`/`gps.time` all report `isValid()` before copying `lat()`/`lng()`/
+  `meters()`/`year()`/`month()`/`day()`/`hour()`/`minute()`/`second()` (GPS time is always UTC) and
+  `gps.satellites.value()` into `sensors.gps`; there's no `gpsPresent` flag like the I2C sensors' `xPresent` --
+  `sensors.gps.valid` (sticky, like the other groups) itself is the presence/fix indicator, since a UART device can't
+  be synchronously probed the way an I2C one can.
 - **MAX7219 LED matrix clock display** — `initMax7219()`/`pollMax7219()`, using MD_Parola/MD_MAX72xx (see Sensor
   libraries above). Four 8x8 modules are split into two MD_Parola zones (`MAX7219_NUM_ZONES` = 2): the left zone
   (`MAX7219_ZONE_LEFT` = 1, modules 2-3) shows `"HH:"` right-aligned, the right zone (`MAX7219_ZONE_RIGHT` = 0,
@@ -226,23 +244,27 @@ A single file-scope `SensorReadings sensors;` struct holds the latest values fro
 `handleAs3935Irq()`) writes its freshly-read values into the matching `sensors.<group>` sub-struct right after
 logging them, so downstream consumers pull from this struct instead of calling the sensor libraries directly. Groups:
 `ds3231` (date/time + on-chip `dieTempC`), `aht20` (`tempC`/`humidityPct`), `bmx280` (`tempC`/`pressurePa`/
-`humidityPct`, plus a `hasHumidity` flag — `humidityPct` is `NAN` on a BMP280), `sgp30` (`eco2Ppm`/`tvocPpb`), and
-`as3935` (`lastIntSrc` and, for a lightning strike, `distanceKm`/`energy`). Every group carries a `valid` flag (false
-until the first good reading, then sticky) and an `updatedMs` millis() timestamp of its last update; static storage
-zero-initializes all of it. The one exception is `sgp30`: its readings are stored from the first measurement, but
-`sgp30.valid` stays false until `SGP30_WARMUP_MS` (4 hours) after power-on, because the sensor's dynamic baseline
-needs hours to settle before eCO2/TVOC mean anything. The MCP `get_sensors` tool serializes this struct;
-nothing else consumes it yet.
+`humidityPct`, plus a `hasHumidity` flag — `humidityPct` is `NAN` on a BMP280), `sgp30` (`eco2Ppm`/`tvocPpb`),
+`as3935` (`lastIntSrc` and, for a lightning strike, `distanceKm`/`energy`), and `gps` (`latitude`/`longitude`/
+`altitudeM` plus UTC date/time fields `year`/`month`/`day`/`hour`/`minute`/`second` and `satellites`). Every group
+carries a `valid` flag (false until the first good reading, then sticky) and an `updatedMs` millis() timestamp of its
+last update; static storage zero-initializes all of it. The one exception is `sgp30`: its readings are stored from
+the first measurement, but `sgp30.valid` stays false until `SGP30_WARMUP_MS` (4 hours) after power-on, because the
+sensor's dynamic baseline needs hours to settle before eCO2/TVOC mean anything. `gps.valid` only ever becomes true
+once TinyGPS++ reports `location`/`altitude`/`date`/`time` are all simultaneously valid (see NEO-6M GPS module
+above); until a fix is acquired it stays false with zeroed fields, same as any other never-yet-updated group. The
+MCP `get_sensors` tool serializes this struct; nothing else consumes it yet.
 
 ### Main loop
 
 `setup()` runs `EEPROM.begin()` + `loadConfig()`, brings up `Wire`, runs a full `scan_i2c()` bus scan once, then
-calls each `initX()` (including `initMax7219()` and, last, `initWifi()` — which can block on the WiFiManager config
-portal, see WiFi above — followed, when WiFi connected, by `showIpOnMax7219()` (blocks while the IP scrolls once)
-and `initMcp()`). `loop()` no longer re-scans the I2C bus or blocks on a `delay()` — it services the AS3935 IRQ flag
-and ticks the MAX7219 display (`pollMax7219()`) every iteration, pumps `mcpServer.handleClient()` when WiFi is up,
-and polls on non-blocking `millis()`-based intervals: `SENSOR_POLL_INTERVAL_MS` (2000ms) for DS3231/AHT20/BMx280, a
-separate `SGP30_MEASURE_INTERVAL_MS` (1000ms) timer for SGP30, and `NTP_SYNC_INTERVAL_MS` / `NTP_RETRY_INTERVAL_MS`
-for `syncNtp()` (see NTP above). The MAX7219 display keeps its own internal 1000ms timer (inside `pollMax7219()`) for
-pushing a fresh HH:MM, decoupled from all of the above since it must also tick Parola's animation every loop
-iteration regardless of that timer.
+calls each `initX()` (including `initGps()` and `initMax7219()` and, last, `initWifi()` — which can block on the
+WiFiManager config portal, see WiFi above — followed, when WiFi connected, by `showIpOnMax7219()` (blocks while the
+IP scrolls once) and `initMcp()`). `loop()` no longer re-scans the I2C bus or blocks on a `delay()` — it services
+the AS3935 IRQ flag, ticks the MAX7219 display (`pollMax7219()`), and drains the GPS UART (`readGps()`) every
+iteration, pumps `mcpServer.handleClient()` when WiFi is up, and polls on non-blocking `millis()`-based intervals:
+`SENSOR_POLL_INTERVAL_MS` (2000ms) for DS3231/AHT20/BMx280, a separate `SGP30_MEASURE_INTERVAL_MS` (1000ms) timer
+for SGP30, and `NTP_SYNC_INTERVAL_MS` / `NTP_RETRY_INTERVAL_MS` for `syncNtp()` (see NTP above). The MAX7219 display
+keeps its own internal 1000ms timer (inside `pollMax7219()`) for pushing a fresh HH:MM, decoupled from all of the
+above since it must also tick Parola's animation every loop iteration regardless of that timer. `readGps()` has no
+timer at all (see NEO-6M GPS module above) since it must be called every iteration to keep up with the UART.

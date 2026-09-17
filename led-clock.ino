@@ -7,7 +7,9 @@
  *   - SGP30        (eCO2/TVOC gas sensor)
  *
  * ...plus a MAX7219 LED matrix display (4 x 8x8 modules, SPI bit-banged)
- * driven by the DS3231 RTC, showing the current time HH:MM.
+ * driven by the DS3231 RTC, showing the current time HH:MM, and a NEO-6M
+ * GPS module on a dedicated UART (not the I2C bus) providing position,
+ * altitude and UTC time/date via NMEA sentences.
  *
  * Wiring (shared bus):
  *   SCL -> IO9
@@ -19,6 +21,10 @@
  *   DIN     -> GPIO6
  *   CLK     -> GPIO10
  *   CS/LOAD -> GPIO7
+ *
+ * Wiring (NEO-6M GPS module, on its own UART, independent of the buses above):
+ *   TX -> IO20 (ESP32 RX)
+ *   RX -> IO21 (ESP32 TX)
  *
  * The AS3935 and BMx280 I2C addresses depend on how each board ties its
  * address pins, so setup() probes the common candidates for each and, for
@@ -50,6 +56,7 @@
 #include <DS3231.h>
 #include <MD_Parola.h>
 #include <MD_MAX72xx.h>
+#include <TinyGPS++.h>
 
 #include "esp32-hal-log.h"
 
@@ -62,16 +69,23 @@ static const int PIN_MAX7219_CLK  = 10;
 static const int PIN_MAX7219_DATA = 6;
 static const int PIN_MAX7219_CS   = 7;
 
+// NEO-6M GPS module, on its own UART.
+static const int PIN_GPS_RX = 20;  // ESP32 RX <- GPS TX
+static const int PIN_GPS_TX = 21;  // ESP32 TX -> GPS RX
+
 #elif defined(CONFIG_IDF_TARGET_ESP32S3)
 static const int PIN_SDA = 15; // 15;
 static const int PIN_SCL = 15; // 16;
 static const int PIN_IRQ = 4;
 
-
 // MAX7219 display pins are fixed regardless of board target.
 static const int PIN_MAX7219_CLK  = 10;
 static const int PIN_MAX7219_DATA = 6;
 static const int PIN_MAX7219_CS   = 7;
+
+// NEO-6M GPS module pins are fixed regardless of board target.
+static const int PIN_GPS_RX = 20;  // ESP32 RX <- GPS TX
+static const int PIN_GPS_TX = 21;  // ESP32 TX -> GPS RX
 #else
 #error "Unknown target"
 #endif
@@ -154,6 +168,21 @@ struct SensorReadings {
     uint8_t distanceKm;  // meaningful only when lastIntSrc == 0x08
     uint32_t energy;     // meaningful only when lastIntSrc == 0x08
   } as3935;
+
+  struct {
+    bool valid;          // true once location+altitude+date+time all have a fix
+    uint32_t updatedMs;
+    double latitude;     // degrees, +north/-south
+    double longitude;    // degrees, +east/-west
+    double altitudeM;    // meters above sea level
+    uint16_t year;       // UTC date -- GPS time is always UTC
+    uint8_t month;
+    uint8_t day;
+    uint8_t hour;        // UTC time
+    uint8_t minute;
+    uint8_t second;
+    uint32_t satellites; // number of satellites used in the fix
+  } gps;
 };
 
 static SensorReadings sensors;
@@ -283,10 +312,8 @@ static void readDs3231() {
   sensors.ds3231.second    = s;
   sensors.ds3231.dieTempC  = temperatureC;
 
-#if 0
   log_printf("DS3231 time: 20%02u-%02u-%02u %02u:%02u:%02u, temperature: %.2f C\n",
              year, month, day, h, m, s, temperatureC);
-#endif
 }
 
 // ---------------------------------------------------------------------
@@ -317,10 +344,9 @@ static void readAht20() {
   sensors.aht20.updatedMs   = millis();
   sensors.aht20.tempC       = temp.temperature;
   sensors.aht20.humidityPct = humidity.relative_humidity;
-#if 0
+
   log_printf("AHT20: temperature=%.2f C, humidity=%.2f %%\n",
              temp.temperature, humidity.relative_humidity);
-#endif
 }
 
 // ---------------------------------------------------------------------
@@ -366,14 +392,12 @@ static void readBmx280() {
   sensors.bmx280.pressurePa  = pressure;
   sensors.bmx280.humidityPct = humidity;
 
-#if 0
   if (bmx280HasHumidity) {
     log_printf("BME280: temperature=%.2f C, pressure=%.2f Pa, humidity=%.2f %%\n",
                temp, pressure, humidity);
   } else {
     log_printf("BMP280: temperature=%.2f C, pressure=%.2f Pa\n", temp, pressure);
   }
-#endif
 }
 
 // ---------------------------------------------------------------------
@@ -418,9 +442,60 @@ static void readSgp30() {
     sensors.sgp30.valid = true;
   }
 
-#if 0
   log_printf("SGP30: eCO2=%u ppm, TVOC=%u ppb\n", sgp.eCO2, sgp.TVOC);
-#endif
+}
+
+// ---------------------------------------------------------------------
+// NEO-6M GPS module (UART, not on the shared I2C bus)
+//
+// TinyGPS++ is fed one byte at a time from a dedicated HardwareSerial
+// (PIN_GPS_RX/PIN_GPS_TX, 9600 baud NMEA) and parses GPGGA/GPRMC sentences
+// internally. readGps() must be called every loop() iteration (not on a
+// timer like the I2C sensors) to drain the UART promptly -- there's no
+// interrupt or buffering strategy here beyond the HardwareSerial's own
+// ring buffer, so falling behind risks dropping bytes mid-sentence.
+// ---------------------------------------------------------------------
+
+static const uint32_t GPS_BAUD = 9600;
+
+HardwareSerial gpsSerial(1);  // UART1 -- UART0 is Serial (logging)
+TinyGPSPlus gps;
+
+static void initGps() {
+  gpsSerial.begin(GPS_BAUD, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
+}
+
+static void readGps() {
+  while (gpsSerial.available() > 0) {
+    int c = gpsSerial.read();
+    log_printf("GPS: c=%c\n", c);
+    if (!gps.encode(c)) {
+      continue;  // sentence not complete yet
+    }
+    if (!gps.location.isValid() || !gps.altitude.isValid() ||
+        !gps.date.isValid() || !gps.time.isValid()) {
+      continue;  // no full fix yet -- keep the previous reading, if any
+    }
+
+    sensors.gps.valid      = true;
+    sensors.gps.updatedMs  = millis();
+    sensors.gps.latitude   = gps.location.lat();
+    sensors.gps.longitude  = gps.location.lng();
+    sensors.gps.altitudeM  = gps.altitude.meters();
+    sensors.gps.year       = gps.date.year();
+    sensors.gps.month      = gps.date.month();
+    sensors.gps.day        = gps.date.day();
+    sensors.gps.hour       = gps.time.hour();
+    sensors.gps.minute     = gps.time.minute();
+    sensors.gps.second     = gps.time.second();
+    sensors.gps.satellites = gps.satellites.isValid() ? gps.satellites.value() : 0;
+
+    log_printf("GPS: lat=%.6f lon=%.6f alt=%.1fm %04u-%02u-%02u %02u:%02u:%02u UTC, sats=%u\n",
+               sensors.gps.latitude, sensors.gps.longitude, sensors.gps.altitudeM,
+               sensors.gps.year, sensors.gps.month, sensors.gps.day,
+               sensors.gps.hour, sensors.gps.minute, sensors.gps.second,
+               sensors.gps.satellites);
+  }
 }
 
 // ---------------------------------------------------------------------
@@ -1064,6 +1139,20 @@ static void mcpFillSensors(JsonObject o) {
   as["lastIntSrc"] = sensors.as3935.lastIntSrc;
   as["distanceKm"] = sensors.as3935.distanceKm;
   as["energy"]     = sensors.as3935.energy;
+
+  JsonObject gp = o["gps"].to<JsonObject>();
+  gp["valid"]      = sensors.gps.valid;
+  gp["updatedMs"]  = sensors.gps.updatedMs;
+  gp["latitude"]   = sensors.gps.latitude;
+  gp["longitude"]  = sensors.gps.longitude;
+  gp["altitudeM"]  = sensors.gps.altitudeM;
+  gp["year"]       = sensors.gps.year;
+  gp["month"]      = sensors.gps.month;
+  gp["day"]        = sensors.gps.day;
+  gp["hour"]       = sensors.gps.hour;
+  gp["minute"]     = sensors.gps.minute;
+  gp["second"]     = sensors.gps.second;
+  gp["satellites"] = sensors.gps.satellites;
 }
 
 static void mcpToolGetSensors(JsonObject result) {
@@ -1206,7 +1295,7 @@ static void mcpFillToolsList(JsonObject result) {
     JsonObject t = tools.add<JsonObject>();
     t["name"] = "get_sensors";
     t["description"] = "Read every sensor group from the clock's SensorReadings struct "
-                       "(ds3231, aht20, bmx280, sgp30, as3935), each with its valid flag "
+                       "(ds3231, aht20, bmx280, sgp30, as3935, gps), each with its valid flag "
                        "and updatedMs timestamp.";
     JsonObject schema = t["inputSchema"].to<JsonObject>();
     schema["type"] = "object";
@@ -1389,6 +1478,7 @@ void setup() {
   initAht20();
   initBmx280();
   initSgp30();
+  initGps();
   initMax7219();
   initWifi();
 
@@ -1421,6 +1511,7 @@ void scan_i2c()
 void loop() {
   handleAs3935Irq();
   pollMax7219();
+  readGps();
 
   static uint32_t lastSensorPoll = 0;
   uint32_t now = millis();
