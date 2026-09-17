@@ -1365,7 +1365,18 @@ static void mcpFillToolsList(JsonObject result) {
 static void mcpSendJson(JsonDocument &doc, int code = 200) {
   String out;
   serializeJson(doc, out);
+  mcpServer.sendHeader("Access-Control-Allow-Origin", "*");
   mcpServer.send(code, "application/json", out);
+}
+
+// Browsers preflight a JSON POST with an OPTIONS request; without a CORS
+// response here the actual POST from mcp-dashboard.html (or any other
+// browser-based MCP client) never leaves the browser.
+static void handleMcpOptions() {
+  mcpServer.sendHeader("Access-Control-Allow-Origin", "*");
+  mcpServer.sendHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  mcpServer.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  mcpServer.send(204);
 }
 
 static void handleMcpPost() {
@@ -1443,6 +1454,7 @@ static void handleMcpPost() {
 
 static void initMcp() {
   mcpServer.on("/mcp", HTTP_POST, handleMcpPost);
+  mcpServer.on("/mcp", HTTP_OPTIONS, handleMcpOptions);
   mcpServer.on("/mcp", HTTP_GET, []() {
     mcpServer.send(405, "text/plain", "MCP endpoint accepts POST only");
   });

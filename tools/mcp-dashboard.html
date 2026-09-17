@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>led-clock MCP Dashboard</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f5f7;
+    --card-bg: #ffffff;
+    --text: #1a1a1a;
+    --muted: #666;
+    --border: #ddd;
+    --accent: #2563eb;
+    --ok: #16a34a;
+    --bad: #dc2626;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16181d;
+      --card-bg: #1f232b;
+      --text: #e8e8e8;
+      --muted: #9aa0a6;
+      --border: #333944;
+      --accent: #5b8cff;
+      --ok: #4ade80;
+      --bad: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 16px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  h1 { font-size: 1.3rem; margin: 0 0 4px; }
+  h2 { font-size: 1rem; margin: 0 0 10px; }
+  .sub { color: var(--muted); font-size: 0.85rem; margin-bottom: 16px; }
+  .connect-bar {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    margin-bottom: 16px;
+  }
+  input[type=text], input[type=number] {
+    background: var(--card-bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 0.9rem;
+  }
+  #serverUrl { flex: 1 1 320px; min-width: 200px; }
+  button {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 7px 14px;
+    font-size: 0.9rem;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button.secondary {
+    background: transparent;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+  }
+  label.checkbox { display: inline-flex; align-items: center; gap: 5px; font-size: 0.85rem; color: var(--muted); }
+  #status {
+    font-size: 0.85rem;
+    margin-bottom: 16px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+  }
+  #status.err { color: var(--bad); border-color: var(--bad); }
+  #status.ok { color: var(--ok); }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+  }
+  .card .badge {
+    float: right;
+    font-size: 0.7rem;
+    padding: 2px 7px;
+    border-radius: 10px;
+    font-weight: 600;
+  }
+  .badge.valid { background: rgba(22,163,74,.15); color: var(--ok); }
+  .badge.invalid { background: rgba(220,38,38,.15); color: var(--bad); }
+  dl { margin: 8px 0 0; }
+  dl div { display: flex; justify-content: space-between; padding: 2px 0; font-size: 0.85rem; }
+  dl dt { color: var(--muted); }
+  dl dd { margin: 0; text-align: right; }
+  .settings-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 12px;
+  }
+  .settings-grid .card form { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+  .field-row { display: flex; align-items: center; gap: 8px; }
+  .field-row label { flex: 0 0 110px; font-size: 0.85rem; color: var(--muted); }
+  .field-row input { flex: 1; }
+  input[type=range] { flex: 1; }
+  .field-row output { width: 28px; text-align: right; font-variant-numeric: tabular-nums; }
+  .card .actions { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+  .msg { font-size: 0.8rem; color: var(--muted); }
+  .msg.err { color: var(--bad); }
+  .msg.ok { color: var(--ok); }
+  details { margin-top: 8px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 0.8rem; }
+  pre {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px;
+    font-size: 0.75rem;
+    overflow-x: auto;
+    max-height: 240px;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+</style>
+</head>
+<body>
+
+<h1>led-clock MCP Dashboard</h1>
+<div class="sub">Talks directly to the clock's unauthenticated MCP JSON-RPC endpoint from your browser.</div>
+
+<div class="connect-bar">
+  <input type="text" id="serverUrl" placeholder="http://led-clock.local:8080/mcp">
+  <button id="connectBtn">Connect</button>
+  <button class="secondary" id="refreshBtn" disabled>Refresh now</button>
+  <label class="checkbox">
+    <input type="checkbox" id="autoRefresh" checked disabled>
+    auto-refresh every
+  </label>
+  <input type="number" id="autoRefreshSecs" value="5" min="1" max="300" style="width:60px" disabled>
+  <span class="sub" style="margin:0">s</span>
+</div>
+
+<div id="status">Not connected.</div>
+
+<h2>Sensors</h2>
+<div class="grid" id="sensorsGrid"></div>
+
+<h2>Settings</h2>
+<div class="settings-grid">
+
+  <div class="card">
+    <strong>NTP sync</strong>
+    <span class="badge" id="ntpSyncBadge"></span>
+    <form id="ntpForm">
+      <div class="field-row">
+        <label for="ntpServer">Server</label>
+        <input type="text" id="ntpServer" placeholder="fi.pool.ntp.org">
+      </div>
+      <div class="field-row">
+        <label for="utcOffset">UTC offset (h)</label>
+        <input type="number" id="utcOffset" min="-14" max="14" step="1">
+      </div>
+      <div class="actions">
+        <button type="submit" id="ntpSaveBtn" disabled>Save</button>
+        <span class="msg" id="ntpMsg"></span>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <strong>Display brightness</strong>
+    <form id="brightnessForm">
+      <div class="field-row">
+        <label for="brightness">Brightness</label>
+        <input type="range" id="brightness" min="0" max="15" step="1" value="4">
+        <output id="brightnessOut">4</output>
+      </div>
+      <div class="actions">
+        <button type="submit" id="brightnessSaveBtn" disabled>Set</button>
+        <span class="msg" id="brightnessMsg"></span>
+      </div>
+    </form>
+  </div>
+
+</div>
+
+<details>
+  <summary>Last raw MCP response</summary>
+  <pre id="rawLog">(none yet)</pre>
+</details>
+
+<script>
+(() => {
+  'use strict';
+
+  const $ = (id) => document.getElementById(id);
+
+  const serverUrlInput   = $('serverUrl');
+  const connectBtn       = $('connectBtn');
+  const refreshBtn       = $('refreshBtn');
+  const autoRefreshBox   = $('autoRefresh');
+  const autoRefreshSecs  = $('autoRefreshSecs');
+  const statusEl         = $('status');
+  const sensorsGrid      = $('sensorsGrid');
+  const rawLog           = $('rawLog');
+
+  const ntpForm       = $('ntpForm');
+  const ntpServerInput = $('ntpServer');
+  const utcOffsetInput = $('utcOffset');
+  const ntpSaveBtn     = $('ntpSaveBtn');
+  const ntpSyncBadge   = $('ntpSyncBadge');
+  const ntpMsg         = $('ntpMsg');
+
+  const brightnessForm    = $('brightnessForm');
+  const brightnessInput   = $('brightness');
+  const brightnessOut     = $('brightnessOut');
+  const brightnessSaveBtn = $('brightnessSaveBtn');
+  const brightnessMsg     = $('brightnessMsg');
+
+  let rpcId = 1;
+  let connected = false;
+  let refreshTimer = null;
+
+  // Remember the last server URL used, per-browser only.
+  try {
+    serverUrlInput.value = localStorage.getItem('led-clock-mcp-url') || '';
+  } catch (_) { /* localStorage unavailable (e.g. file:// in some browsers) -- fine, just don't remember it */ }
+
+  function setStatus(text, kind) {
+    statusEl.textContent = text;
+    statusEl.className = kind || '';
+  }
+
+  function setMsg(el, text, kind) {
+    el.textContent = text;
+    el.className = 'msg' + (kind ? ' ' + kind : '');
+    if (text) setTimeout(() => { if (el.textContent === text) el.textContent = ''; }, 4000);
+  }
+
+  async function rpcCall(method, params) {
+    const url = serverUrlInput.value.trim();
+    if (!url) throw new Error('enter the MCP server URL first');
+
+    const body = { jsonrpc: '2.0', id: rpcId++, method };
+    if (params !== undefined) body.params = params;
+
+    let res;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    } catch (err) {
+      throw new Error(
+        'network/CORS error reaching ' + url + ' (' + err.message + '). ' +
+        'Make sure the clock is on and the URL/port are correct.'
+      );
+    }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+
+    const json = await res.json();
+    rawLog.textContent = JSON.stringify(json, null, 2);
+    if (json.error) throw new Error(json.error.message || 'RPC error');
+    return json.result;
+  }
+
+  async function callTool(name, args) {
+    const result = await rpcCall('tools/call', { name, arguments: args || {} });
+    if (result && result.isError) {
+      const text = result.content && result.content[0] && result.content[0].text;
+      throw new Error(text || (name + ' failed'));
+    }
+    return (result && result.structuredContent) || {};
+  }
+
+  function fmt(v) {
+    if (v === null || v === undefined) return '–';
+    if (typeof v === 'number') return Number.isInteger(v) ? String(v) : v.toFixed(2);
+    return String(v);
+  }
+
+  function renderCard(title, group, fields) {
+    const card = document.createElement('div');
+    card.className = 'card';
+    const validClass = group && group.valid ? 'valid' : 'invalid';
+    const validText = group && group.valid ? 'valid' : 'no data';
+    const ageMs = group && group.updatedMs !== undefined ? group.updatedMs : null;
+
+    let html = '<span class="badge ' + validClass + '">' + validText + '</span><strong>' + title + '</strong><dl>';
+    for (const [label, key] of fields) {
+      html += '<div><dt>' + label + '</dt><dd>' + fmt(group ? group[key] : undefined) + '</dd></div>';
+    }
+    if (ageMs !== null) {
+      html += '<div><dt>updated (ms since boot)</dt><dd>' + fmt(ageMs) + '</dd></div>';
+    }
+    html += '</dl>';
+    card.innerHTML = html;
+    return card;
+  }
+
+  function renderSensors(sensors) {
+    sensorsGrid.innerHTML = '';
+
+    // DS3231 gets a composed date/time row instead of separate y/m/d/h/m/s rows.
+    const ds = sensors.ds3231 || {};
+    const dsCard = renderCard('DS3231 clock', ds, [
+      ['Die temp (°C)', 'dieTempC'],
+    ]);
+    if (ds.valid) {
+      const p2 = (n) => String(n).padStart(2, '0');
+      const dt = document.createElement('div');
+      dt.innerHTML = '<dt>Local time</dt><dd>' + fmt(ds.year) + '-' + p2(ds.month) + '-' + p2(ds.day) +
+        ' ' + p2(ds.hour) + ':' + p2(ds.minute) + ':' + p2(ds.second) + '</dd>';
+      dsCard.querySelector('dl').prepend(dt);
+    }
+    sensorsGrid.appendChild(dsCard);
+
+    sensorsGrid.appendChild(renderCard('AHT20', sensors.aht20, [
+      ['Temp (°C)', 'tempC'],
+      ['Humidity (%)', 'humidityPct'],
+    ]));
+
+    sensorsGrid.appendChild(renderCard('BMx280', sensors.bmx280, [
+      ['Temp (°C)', 'tempC'],
+      ['Pressure (Pa)', 'pressurePa'],
+      ['Humidity (%)', 'humidityPct'],
+      ['Has humidity', 'hasHumidity'],
+    ]));
+
+    sensorsGrid.appendChild(renderCard('SGP30', sensors.sgp30, [
+      ['eCO2 (ppm)', 'eco2Ppm'],
+      ['TVOC (ppb)', 'tvocPpb'],
+    ]));
+
+    sensorsGrid.appendChild(renderCard('AS3935 lightning', sensors.as3935, [
+      ['Last interrupt', 'lastIntSrc'],
+      ['Distance (km)', 'distanceKm'],
+      ['Energy', 'energy'],
+    ]));
+
+    const gps = sensors.gps || {};
+    const gpsCard = renderCard('GPS', gps, [
+      ['Latitude', 'latitude'],
+      ['Longitude', 'longitude'],
+      ['Altitude (m)', 'altitudeM'],
+      ['Satellites', 'satellites'],
+    ]);
+    if (gps.valid) {
+      const p2 = (n) => String(n).padStart(2, '0');
+      const dt = document.createElement('div');
+      dt.innerHTML = '<dt>UTC date</dt><dd>' + fmt(gps.year) + '-' + p2(gps.month) + '-' + p2(gps.day) +
+        ' ' + p2(gps.hour) + ':' + p2(gps.minute) + ':' + p2(gps.second) + '</dd>';
+      gpsCard.querySelector('dl').appendChild(dt);
+    }
+    sensorsGrid.appendChild(gpsCard);
+  }
+
+  async function refreshAll() {
+    setStatus('Refreshing…');
+    const results = await Promise.allSettled([
+      callTool('get_sensors'),
+      callTool('get_ntp_config'),
+      callTool('get_display_brightness'),
+    ]);
+
+    const [sensorsRes, ntpRes, brightnessRes] = results;
+
+    if (sensorsRes.status === 'fulfilled') {
+      renderSensors(sensorsRes.value);
+    }
+
+    if (ntpRes.status === 'fulfilled') {
+      const cfg = ntpRes.value;
+      if (document.activeElement !== ntpServerInput) ntpServerInput.value = cfg.ntp_server || '';
+      if (document.activeElement !== utcOffsetInput) utcOffsetInput.value = cfg.utc_offset_hours;
+      ntpSyncBadge.textContent = cfg.last_sync_ok ? 'last sync ok' : 'last sync failed';
+      ntpSyncBadge.className = 'badge ' + (cfg.last_sync_ok ? 'valid' : 'invalid');
+    }
+
+    if (brightnessRes.status === 'fulfilled') {
+      if (document.activeElement !== brightnessInput) {
+        brightnessInput.value = brightnessRes.value.brightness;
+        brightnessOut.textContent = brightnessRes.value.brightness;
+      }
+    }
+
+    const failed = results.filter((r) => r.status === 'rejected');
+    if (failed.length) {
+      setStatus('Connected, but ' + failed.length + ' request(s) failed: ' +
+        failed.map((r) => r.reason.message).join('; '), 'err');
+    } else {
+      setStatus('Connected. Last refresh ' + new Date().toLocaleTimeString() + '.', 'ok');
+    }
+  }
+
+  function scheduleAutoRefresh() {
+    if (refreshTimer) clearInterval(refreshTimer);
+    if (!autoRefreshBox.checked) return;
+    const secs = Math.max(1, Number(autoRefreshSecs.value) || 5);
+    refreshTimer = setInterval(() => { refreshAll().catch((err) => setStatus(err.message, 'err')); }, secs * 1000);
+  }
+
+  connectBtn.addEventListener('click', async () => {
+    const url = serverUrlInput.value.trim();
+    if (!url) { setStatus('Enter the MCP server URL first, e.g. http://led-clock.local:8080/mcp', 'err'); return; }
+    try { localStorage.setItem('led-clock-mcp-url', url); } catch (_) { /* ignore */ }
+
+    connectBtn.disabled = true;
+    setStatus('Connecting…');
+    try {
+      await rpcCall('initialize', {
+        protocolVersion: '2025-06-18',
+        capabilities: {},
+        clientInfo: { name: 'mcp-dashboard.html', version: '1.0' },
+      });
+      connected = true;
+      refreshBtn.disabled = false;
+      autoRefreshBox.disabled = false;
+      autoRefreshSecs.disabled = false;
+      ntpSaveBtn.disabled = false;
+      brightnessSaveBtn.disabled = false;
+      await refreshAll();
+      scheduleAutoRefresh();
+    } catch (err) {
+      connected = false;
+      setStatus(err.message, 'err');
+    } finally {
+      connectBtn.disabled = false;
+    }
+  });
+
+  refreshBtn.addEventListener('click', () => {
+    refreshAll().catch((err) => setStatus(err.message, 'err'));
+  });
+
+  autoRefreshBox.addEventListener('change', scheduleAutoRefresh);
+  autoRefreshSecs.addEventListener('change', scheduleAutoRefresh);
+
+  brightnessInput.addEventListener('input', () => { brightnessOut.textContent = brightnessInput.value; });
+
+  ntpForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!connected) return;
+    ntpSaveBtn.disabled = true;
+    try {
+      await callTool('set_ntp_config', {
+        ntp_server: ntpServerInput.value.trim(),
+        utc_offset_hours: Number(utcOffsetInput.value),
+      });
+      setMsg(ntpMsg, 'Saved, re-syncing…', 'ok');
+      await refreshAll();
+    } catch (err) {
+      setMsg(ntpMsg, err.message, 'err');
+    } finally {
+      ntpSaveBtn.disabled = false;
+    }
+  });
+
+  brightnessForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!connected) return;
+    brightnessSaveBtn.disabled = true;
+    try {
+      await callTool('set_display_brightness', { brightness: Number(brightnessInput.value) });
+      setMsg(brightnessMsg, 'Saved.', 'ok');
+    } catch (err) {
+      setMsg(brightnessMsg, err.message, 'err');
+    } finally {
+      brightnessSaveBtn.disabled = false;
+    }
+  });
+
+  if (serverUrlInput.value) connectBtn.click();
+})();
+</script>
+
+</body>
+</html>

@@ -236,7 +236,10 @@ The file is organized into clearly delimited sections (see the `// ----` banners
   then clears `ntpLastAttemptMs` to force an immediate NTP re-sync — a get also reports `last_sync_ok`), and
   `get_display_brightness` / `set_display_brightness` (`brightness` 0..15, applied via `setMax7219Brightness()` and
   persisted). The `get_*` / `set_*` responses share a `mcpFill*` builder. Every tool result carries both a `content`
-  text block and a `structuredContent` object.
+  text block and a `structuredContent` object. Responses (and the `HTTP_OPTIONS` preflight response from
+  `handleMcpOptions`) carry `Access-Control-Allow-Origin: *` so a browser-based client — e.g. `tools/mcp-dashboard.html`
+  — can call the endpoint via `fetch()` directly; without it the browser's CORS preflight for a JSON POST would be
+  rejected before the real request is ever sent.
 
 ### Global sensor readings
 
