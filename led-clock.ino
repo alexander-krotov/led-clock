@@ -472,29 +472,39 @@ static void readGps() {
     if (!gps.encode(c)) {
       continue;  // sentence not complete yet
     }
-    if (!gps.location.isValid() || !gps.altitude.isValid() ||
-        !gps.date.isValid() || !gps.time.isValid()) {
-      continue;  // no full fix yet -- keep the previous reading, if any
+
+    // Position and time/date are latched independently, each only when
+    // TinyGPS++ currently reports it valid -- a lost fix (location/altitude
+    // go invalid) must not blank out the last known-good coordinates, and
+    // must not hold back a still-valid time/date update, or vice versa.
+    // Once sensors.gps.valid is set it stays sticky like every other group,
+    // even while the live fix comes and goes.
+    if (gps.location.isValid() && gps.altitude.isValid()) {
+      sensors.gps.valid      = true;
+      sensors.gps.updatedMs  = millis();
+      sensors.gps.latitude   = gps.location.lat();
+      sensors.gps.longitude  = gps.location.lng();
+      sensors.gps.altitudeM  = gps.altitude.meters();
+      sensors.gps.satellites = gps.satellites.isValid() ? gps.satellites.value() : 0;
+
+      log_printf("GPS: lat=%.6f lon=%.6f alt=%.1fm, sats=%u\n",
+                 sensors.gps.latitude, sensors.gps.longitude, sensors.gps.altitudeM,
+                 sensors.gps.satellites);
     }
 
-    sensors.gps.valid      = true;
-    sensors.gps.updatedMs  = millis();
-    sensors.gps.latitude   = gps.location.lat();
-    sensors.gps.longitude  = gps.location.lng();
-    sensors.gps.altitudeM  = gps.altitude.meters();
-    sensors.gps.year       = gps.date.year();
-    sensors.gps.month      = gps.date.month();
-    sensors.gps.day        = gps.date.day();
-    sensors.gps.hour       = gps.time.hour();
-    sensors.gps.minute     = gps.time.minute();
-    sensors.gps.second     = gps.time.second();
-    sensors.gps.satellites = gps.satellites.isValid() ? gps.satellites.value() : 0;
+    if (gps.date.isValid() && gps.time.isValid()) {
+      sensors.gps.updatedMs = millis();
+      sensors.gps.year      = gps.date.year();
+      sensors.gps.month     = gps.date.month();
+      sensors.gps.day       = gps.date.day();
+      sensors.gps.hour      = gps.time.hour();
+      sensors.gps.minute    = gps.time.minute();
+      sensors.gps.second    = gps.time.second();
 
-    log_printf("GPS: lat=%.6f lon=%.6f alt=%.1fm %04u-%02u-%02u %02u:%02u:%02u UTC, sats=%u\n",
-               sensors.gps.latitude, sensors.gps.longitude, sensors.gps.altitudeM,
-               sensors.gps.year, sensors.gps.month, sensors.gps.day,
-               sensors.gps.hour, sensors.gps.minute, sensors.gps.second,
-               sensors.gps.satellites);
+      log_printf("GPS: UTC %04u-%02u-%02u %02u:%02u:%02u\n",
+                 sensors.gps.year, sensors.gps.month, sensors.gps.day,
+                 sensors.gps.hour, sensors.gps.minute, sensors.gps.second);
+    }
   }
 }
 

@@ -145,11 +145,15 @@ The file is organized into clearly delimited sections (see the `// ----` banners
   `readGps()` is called unconditionally from every `loop()` iteration rather than on a `SENSOR_POLL_INTERVAL_MS`
   timer, since it just drains whatever bytes are currently sitting in the UART's ring buffer
   (`gpsSerial.available()`/`.read()`) into `gps.encode()` -- polling it too infrequently risks the buffer filling up
-  and bytes being dropped mid-sentence. Each time `encode()` reports a complete NMEA sentence, `readGps()` checks
-  `gps.location`/`gps.altitude`/`gps.date`/`gps.time` all report `isValid()` before copying `lat()`/`lng()`/
-  `meters()`/`year()`/`month()`/`day()`/`hour()`/`minute()`/`second()` (GPS time is always UTC) and
-  `gps.satellites.value()` into `sensors.gps`; there's no `gpsPresent` flag like the I2C sensors' `xPresent` --
-  `sensors.gps.valid` (sticky, like the other groups) itself is the presence/fix indicator, since a UART device can't
+  and bytes being dropped mid-sentence. Each time `encode()` reports a complete NMEA sentence, `readGps()` updates
+  position and time independently of each other, each gated on its own `isValid()`: `gps.location`/`gps.altitude`
+  valid copies `lat()`/`lng()`/`meters()` and `gps.satellites.value()` into `sensors.gps`, while `gps.date`/`gps.time`
+  valid (separately) copies `year()`/`month()`/`day()`/`hour()`/`minute()`/`second()` (GPS time is always UTC). Either
+  update also bumps `sensors.gps.updatedMs`. Splitting the two means a lost position fix doesn't hold back a still-valid
+  time update (or vice versa) and never blanks out the last known-good values -- once a field has been read
+  successfully it simply stays at its last reading until the next successful read of that same kind, sticky the same
+  way `sensors.gps.valid` itself is. There's no `gpsPresent` flag like the I2C sensors' `xPresent` -- `sensors.gps.valid`
+  (set, and latched, the first time a position fix is read) is the presence/fix indicator, since a UART device can't
   be synchronously probed the way an I2C one can.
 - **MAX7219 LED matrix clock display** — `initMax7219()`/`pollMax7219()`, using MD_Parola/MD_MAX72xx (see Sensor
   libraries above). Four 8x8 modules are split into two MD_Parola zones (`MAX7219_NUM_ZONES` = 2): the left zone
@@ -254,9 +258,12 @@ carries a `valid` flag (false until the first good reading, then sticky) and an 
 last update; static storage zero-initializes all of it. The one exception is `sgp30`: its readings are stored from
 the first measurement, but `sgp30.valid` stays false until `SGP30_WARMUP_MS` (4 hours) after power-on, because the
 sensor's dynamic baseline needs hours to settle before eCO2/TVOC mean anything. `gps.valid` only ever becomes true
-once TinyGPS++ reports `location`/`altitude`/`date`/`time` are all simultaneously valid (see NEO-6M GPS module
-above); until a fix is acquired it stays false with zeroed fields, same as any other never-yet-updated group. The
-MCP `get_sensors` tool serializes this struct; nothing else consumes it yet.
+once TinyGPS++ reports a `location`/`altitude` fix (see NEO-6M GPS module above); until then it stays false with
+zeroed fields, same as any other never-yet-updated group. Unlike the other groups, `gps`'s individual fields don't
+all update in lockstep with `valid`/`updatedMs`: position and date/time are latched independently, each sticking at
+its own last successfully-read value even while the other is currently unavailable (e.g. position keeps its last fix
+while the receiver briefly reports an invalid date/time, or vice versa). The MCP `get_sensors` tool serializes this
+struct; nothing else consumes it yet.
 
 ### Main loop
 
