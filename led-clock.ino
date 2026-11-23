@@ -46,8 +46,8 @@
 #include <EEPROM.h>
 #include <ArduinoJson.h>
 
-#define WM_MDNS  // let WiFiManager start an mDNS responder for its hostname
 #include <WiFiManager.h>
+#include <ESPmDNS.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <Adafruit_SGP30.h>
@@ -552,6 +552,26 @@ static const MD_MAX72XX::transformType_t MAX7219_RIGHT_NUDGE_XFORM = MD_MAX72XX:
 MD_Parola maxDisplay(MAX7219_HARDWARE_TYPE, PIN_MAX7219_DATA, PIN_MAX7219_CLK,
                       PIN_MAX7219_CS, MAX7219_MAX_DEVICES);
 
+// Clock font: full 8-row-high digits (the library's default font draws them
+// 7 rows high, leaving the bottom row blank), plus the default font's ':'
+// copied unchanged. Only covers '0'..':' -- the HH: / MM zones never show
+// anything else. Version-1 MD_MAX72XX font header: 'F', 1, first char, last
+// char, height; then per char: width, column bytes (bit 0 = top row).
+static MD_MAX72XX::fontType_t PROGMEM max7219ClockFont[] = {
+  'F', 1, '0', ':', 8,
+  5, 0x7e, 0xa1, 0x99, 0x85, 0x7e,  // 48 - '0'
+  3, 0x04, 0x02, 0xff,              // 49 - '1'
+  5, 0x82, 0xc1, 0xa1, 0x91, 0x8e,  // 50 - '2'
+  5, 0x41, 0x81, 0x89, 0x8d, 0x73,  // 51 - '3'
+  5, 0x1f, 0x10, 0x10, 0x10, 0xff,  // 52 - '4'
+  5, 0x4f, 0x89, 0x89, 0x89, 0x71,  // 53 - '5'
+  5, 0x7e, 0x89, 0x89, 0x89, 0x70,  // 54 - '6'
+  5, 0x03, 0x01, 0x01, 0x01, 0xff,  // 55 - '7'
+  5, 0x76, 0x89, 0x89, 0x89, 0x76,  // 56 - '8'
+  5, 0x0e, 0x91, 0x91, 0x91, 0x7e,  // 57 - '9'
+  2, 0x6c, 0x6c,                    // 58 - ':' (same as the default font)
+};
+
 // A zone's text change is played as a single custom scroll-down animation
 // that shifts the whole zone (both old and new text) down one pixel row at a
 // time: the old text's rows exit at the bottom while the new text's rows
@@ -599,9 +619,8 @@ static void initMax7219Zones() {
   max7219Zones[MAX7219_ZONE_LEFT].devStart  = 2;
   max7219Zones[MAX7219_ZONE_LEFT].devEnd    = 3;
 
-  MD_MAX72XX::fontType_t *fontDef;
-
   for (uint8_t z = 0; z < MAX7219_NUM_ZONES; z++) {
+    maxDisplay.setFont(z, max7219ClockFont);
     maxDisplay.setSpeed(z, MAX7219_SCROLL_SPEED);
     maxDisplay.setIntensity(z, max7219Brightness);
     maxDisplay.setPause(z, 0);
@@ -912,10 +931,12 @@ static void loadConfig() {
 // fields are editable at first setup (or whenever WiFi is reconfigured);
 // otherwise the values persisted in EEPROM are used as-is.
 //
-// With WM_MDNS defined (see the include above), setHostname() also makes
-// WiFiManager bring up an mDNS responder, so the clock is reachable as
-// "led-clock.local". ESP32's mDNS runs in the background -- no loop() tick
-// is needed to keep it alive.
+// Once connected, initWifi() starts an mDNS responder itself (MDNS.begin),
+// so the clock is reachable as "led-clock.local". This can't be left to
+// WiFiManager's own WM_MDNS option: that macro is checked inside
+// WiFiManager.cpp, a separate translation unit, so #defining it in this
+// sketch has no effect. ESP32's mDNS runs in the background -- no loop()
+// tick is needed to keep it alive.
 // ---------------------------------------------------------------------
 
 static const char WIFI_DEVICE_NAME[] = "led-clock";
@@ -947,9 +968,13 @@ static void initWifi() {
   wm.stopWebPortal();
 
   if (wifiConnected) {
-    log_printf("WiFi connected: SSID=%s, IP=%s, mDNS=%s.local\n",
-               WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(),
-               WIFI_DEVICE_NAME);
+    log_printf("WiFi connected: SSID=%s, IP=%s\n",
+               WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+    if (MDNS.begin(WIFI_DEVICE_NAME)) {
+      log_printf("mDNS responder started: %s.local\n", WIFI_DEVICE_NAME);
+    } else {
+      log_printf("mDNS responder failed to start\n");
+    }
   } else {
     log_printf("WiFi not connected (config portal timed out)\n");
   }
@@ -982,6 +1007,9 @@ static void showIpOnMax7219() {
   // Repurpose zone 0 to span every module for a single right-to-left scroll.
   maxDisplay.setZone(MAX7219_ZONE_RIGHT, 0, MAX7219_MAX_DEVICES - 1);
   maxDisplay.setIntensity(MAX7219_ZONE_RIGHT, max7219Brightness);
+  // The clock font has no '.', so scroll the IP in the library's default
+  // font (nullptr); initMax7219Zones() below switches back to the clock font.
+  maxDisplay.setFont(MAX7219_ZONE_RIGHT, nullptr);
   maxDisplay.displayClear();
   // Parola keeps the text pointer, not a copy -- `ip` must outlive the scroll
   // below, and it does (initMax7219Zones() swaps the pointer before return).

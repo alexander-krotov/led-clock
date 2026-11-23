@@ -96,15 +96,12 @@ All five sensors are driven through third-party Arduino libraries rather than ha
   Not gated behind a presence probe like the I2C sensors — there's no synchronous way to ACK/NAK a UART device, so
   `sensors.gps.valid` (see Global sensor readings below) only becomes true once a full fix has actually been decoded.
 
-- **WiFiManager** (tzapu, `WiFiManager.h`, pulls in the ESP32 core `WiFi.h` and — because `WM_MDNS` is `#define`d
-  before the include — `ESPmDNS.h`) — `initWifi()` sets STA mode, then `wm.setHostname("led-clock")` and
-  `wm.autoConnect("led-clock")` with a 60s `setConfigPortalTimeout`; on failure to join a known network it serves a
-  captive portal from a `led-clock` AP. Two `WiFiManagerParameter`s (`"ntp"`, `"utc"`) are added to the portal so
-  the NTP server name and UTC offset can be entered alongside the WiFi credentials; `setSaveParamsCallback` copies
-  them into `ntpServer` / `utcOffsetHours` and calls `saveConfig()`. With `WM_MDNS` set, `setHostname()` also makes
-  WiFiManager start an mDNS responder, so the clock answers to `led-clock.local` (ESP32 runs mDNS in the background —
-  no `loop()` tick needed). WiFi credentials persist in the ESP32 NVS (the library's own storage), separate from the
-  sketch's own EEPROM config.
+- **WiFiManager** (tzapu, `WiFiManager.h`, pulls in the ESP32 core `WiFi.h`) — `initWifi()` sets STA mode, then
+  `wm.setHostname("led-clock")` and `wm.autoConnect("led-clock")` with a 60s `setConfigPortalTimeout`; on failure to
+  join a known network it serves a captive portal from a `led-clock` AP. Two `WiFiManagerParameter`s (`"ntp"`,
+  `"utc"`) are added to the portal so the NTP server name and UTC offset can be entered alongside the WiFi
+  credentials; `setSaveParamsCallback` copies them into `ntpServer` / `utcOffsetHours` and calls `saveConfig()`. WiFi
+  credentials persist in the ESP32 NVS (the library's own storage), separate from the sketch's own EEPROM config.
 - **`EEPROM.h`** / **`WiFiUdp.h`** (ESP32 core) — `EEPROM` backs the persistent NTP config (see the EEPROM section
   below); `WiFiUDP` carries the SNTP request in the NTP section.
 - **`WebServer.h`** (ESP32 core) + **ArduinoJson** v7 — serve the MCP endpoint (see the MCP section). The core's
@@ -159,8 +156,11 @@ The file is organized into clearly delimited sections (see the `// ----` banners
   libraries above). Four 8x8 modules are split into two MD_Parola zones (`MAX7219_NUM_ZONES` = 2): the left zone
   (`MAX7219_ZONE_LEFT` = 1, modules 2-3) shows `"HH:"` right-aligned, the right zone (`MAX7219_ZONE_RIGHT` = 0,
   modules 0-1) shows `"MM"` left-aligned, so the colon (the left zone's trailing glyph) sits at the middle of the
-  chain and reads as the HH:MM separator (no hand-drawn colon any more). Keeping the colon in the hours zone means a
-  minutes-only update never scrolls it. Both zones are fed from the DS3231 RTC (`rtc.getHour()`/`getMinute()`) once a
+  chain and reads as the HH:MM separator (no hand-drawn colon any more). Both zones use the custom
+  `max7219ClockFont` (set per zone in `initMax7219Zones()`): full 8-row digits, plus the default font's `':'` copied
+  unchanged, covering only `'0'..':'`; `showIpOnMax7219()` switches zone 0 back to the default font (`nullptr`) for
+  the IP scroll since the clock font has no `'.'`. Keeping the colon in the hours zone means a minutes-only update
+  never scrolls it. Both zones are fed from the DS3231 RTC (`rtc.getHour()`/`getMinute()`) once a
   second; a zone's very first render (`Max7219ZoneState.current` still the empty string `initMax7219Zones()` sets it
   to -- true at boot, and again right after `showIpOnMax7219()` calls `initMax7219Zones()`) is shown immediately via
   `showMax7219ZoneImmediate()` (a plain `PA_PRINT`/`PA_NO_EFFECT` static redraw), since there's no meaningful old
@@ -213,10 +213,13 @@ The file is organized into clearly delimited sections (see the `// ----` banners
 - **WiFi** — `initWifi()` (see WiFiManager under Sensor libraries above). Sets `WIFI_STA` mode, calls
   `WiFiManager::setHostname("led-clock")` and `autoConnect("led-clock")` with a 60s config-portal timeout, recording
   the outcome in the file-scope `wifiConnected` flag. It also registers the `"ntp"` / `"utc"` portal parameters and a
-  save callback (see WiFiManager above). `WM_MDNS` is `#define`d before the WiFiManager include, so the device is also
-  reachable at `led-clock.local` over mDNS. This is the one `initX()` that can block `setup()` for a long time: if no
-  known network is reachable the captive portal runs until the user configures WiFi or `WIFI_MANAGER_TIMEOUT_S`
-  elapses, and the clock display does not tick during that window.
+  save callback (see WiFiManager above). Once connected, it starts the mDNS responder itself
+  (`MDNS.begin("led-clock")`, core `ESPmDNS.h`), so the device is also reachable at `led-clock.local` (ESP32 runs
+  mDNS in the background — no `loop()` tick needed). Don't rely on WiFiManager's `WM_MDNS` option for this: that
+  macro is tested inside `WiFiManager.cpp`, a separate translation unit, so `#define`-ing it in the sketch silently
+  does nothing. This is the one `initX()` that can block `setup()` for a long time: if no known network is
+  reachable the captive portal runs until the user configures WiFi or `WIFI_MANAGER_TIMEOUT_S` elapses, and the clock
+  display does not tick during that window.
   When the connection succeeds, `setup()` calls `showIpOnMax7219()`, which scrolls `WiFi.localIP()` once
   right-to-left across the whole four-module chain and then restores the clock layout. It does this by blanking the
   left zone, widening zone 0 (`MAX7219_ZONE_RIGHT`) to span all `MAX7219_MAX_DEVICES` modules, running a
